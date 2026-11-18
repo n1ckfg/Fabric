@@ -10,7 +10,7 @@ public final class GaussianBlurMaskNode: BaseMultiPassBlurEffectTwoChannelNode {
     override public class var nodeTimeMode: Node.TimeMode { .None }
     override public class var nodeDescription: String { "Separable Gaussian-style blur with progressive downsample passes." }
 
-    override class var sourceShaderName: String { "GaussianBlurMaskShader" }
+    override public class var sourceShaderName: String { "GaussianBlurMaskShader" }
 
     private struct GaussianPassUniforms {
         var direction: simd_float2
@@ -18,7 +18,7 @@ public final class GaussianBlurMaskNode: BaseMultiPassBlurEffectTwoChannelNode {
         var padding: Float
     }
 
-    @ObservationIgnored private var passUniformsBuffers: [StructBuffer<GaussianPassUniforms>] = []
+    private var passUniformsBuffers: [StructBuffer<GaussianPassUniforms>] = []
 
     required init(context: Context, fileURL: URL) throws {
         try super.init(context: context, fileURL: fileURL)
@@ -42,28 +42,27 @@ public final class GaussianBlurMaskNode: BaseMultiPassBlurEffectTwoChannelNode {
         return self.passUniformsBuffers[index]
     }
 
-    override public func execute(context: GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
-//        guard self.shouldExecuteThisFrame() else {
-//            return
-//        }
-
-        guard let inputTexture = self.inputTexturePort.value?.texture,
-              let inputMask = self.inputTexture2Port.value?.texture
-        else {
+        guard let (inputImage, inputMaskImage) = self.validatedTwoInputImages() else {
             self.outputTexturePort.send(nil)
             return
         }
+
+        let outputWidth = Int(inputImage.presentationSize.width.rounded())
+        let outputHeight = Int(inputImage.presentationSize.height.rounded())
 
         let amount = self.floatParameterValue(named: "Amount")
 
         var steps: [MultiPassStep] = []
 
         if amount <= Self.lowAmountThreshold {
-            steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 1.0, vector: simd_float2(1.0, 0.0)))
-            steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 1.0, vector: simd_float2(0.0, 1.0)))
+            steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 1.0, vector: simd_float2(1.0, 0.0)))
+            steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 1.0, vector: simd_float2(0.0, 1.0)))
         } else {
             let stageRatios: [(ratio: Float, multiplier: Float)] = [
                 (0.2, 1.0),
@@ -73,8 +72,8 @@ public final class GaussianBlurMaskNode: BaseMultiPassBlurEffectTwoChannelNode {
             ]
 
             for stage in stageRatios {
-                let stageSize = self.scaledPassSize(baseWidth: inputTexture.width,
-                                                    baseHeight: inputTexture.height,
+                let stageSize = self.scaledPassSize(baseWidth: outputWidth,
+                                                    baseHeight: outputHeight,
                                                     amount: amount,
                                                     passRatio: stage.ratio)
 
@@ -89,14 +88,15 @@ public final class GaussianBlurMaskNode: BaseMultiPassBlurEffectTwoChannelNode {
                                            vector: simd_float2(0.0, 1.0)))
             }
 
-            steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 1.0, vector: simd_float2(1.0, 0.0)))
-            steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 1.0, vector: simd_float2(0.0, 1.0)))
+            steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 1.0, vector: simd_float2(1.0, 0.0)))
+            steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 1.0, vector: simd_float2(0.0, 1.0)))
         }
 
-        if let outputImage = self.runPassChain(context: context,
+        if let outputImage = try self.runPassChain(renderer: renderer,
+                                               executionInfo: executionInfo,
                                                commandBuffer: commandBuffer,
-                                               inputATexture: inputTexture,
-                                               inputBTexture: inputMask,
+                                               inputAImage: inputImage,
+                                               inputBImage: inputMaskImage,
                                                steps: steps,
                                                prepareStep: { [weak self] stepIndex, step in
             guard let self else { return }

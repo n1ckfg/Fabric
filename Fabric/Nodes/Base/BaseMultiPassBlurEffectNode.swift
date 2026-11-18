@@ -3,8 +3,9 @@ import Metal
 import Satin
 import simd
 
-public class BaseMultiPassBlurEffectNode: BaseEffectNode
+public class BaseMultiPassBlurEffectNode: BaseImageNode
 {
+    override public class var defaultImageInputCountHint: Int? { 1 }
     static let maxBlur:Float = 50.0
     
     public struct MultiPassStep
@@ -24,11 +25,38 @@ public class BaseMultiPassBlurEffectNode: BaseEffectNode
     }
 
     public static let lowAmountThreshold: Float = 0.0
+    private var hasLoggedInputCountMismatch = false
+    private var textureTransformBuffers: [StructBuffer<simd_float4x4>] = []
 
 
     public func floatParameterValue(named name: String, default defaultValue: Float = 0.0) -> Float
     {
         self.postMaterial.parameters.get(name, as: FloatParameter.self)?.value ?? defaultValue
+    }
+
+    public func validatedSingleInputImage() -> FabricImage? {
+        let inputs = self.imageInputPorts()
+        if inputs.count != 1 {
+            if self.hasLoggedInputCountMismatch == false {
+                print("\(self) expected exactly 1 input image, but got \(inputs.count).")
+                self.hasLoggedInputCountMismatch = true
+            }
+            return nil
+        }
+
+        self.hasLoggedInputCountMismatch = false
+        return inputs[0].value
+    }
+
+    private func textureTransformBuffer(forStepIndex index: Int) -> StructBuffer<simd_float4x4> {
+        while self.textureTransformBuffers.count <= index {
+            let buffer = StructBuffer<simd_float4x4>(device: self.context.device,
+                                                      count: 1,
+                                                      label: "Multi-Pass Blur Texture Transform \(self.textureTransformBuffers.count)")
+            self.textureTransformBuffers.append(buffer)
+        }
+
+        return self.textureTransformBuffers[index]
     }
 
     public func scaledPassSize(baseWidth: Int, baseHeight: Int, amount: Float, passRatio: Float) -> (width: Int, height: Int)
@@ -42,45 +70,45 @@ public class BaseMultiPassBlurEffectNode: BaseEffectNode
         return (width, height)
     }
 
-    public func runPassChain(context: GraphExecutionContext,
+    public func runPassChain(renderer:GraphRenderer,
+                             executionInfo: GraphExecutionInfo,
                              commandBuffer: MTLCommandBuffer,
-                             inputTexture: MTLTexture,
+                             inputImage: FabricImage,
                              steps: [MultiPassStep],
-                             prepareStep: (Int, MultiPassStep) -> Void ) -> FabricImage? {
-        guard let graphRenderer = context.graphRenderer else {
-            return nil
-        }
+                             prepareStep: (Int, MultiPassStep) -> Void ) throws -> FabricImage? {
 
         guard !steps.isEmpty else {
             return nil
         }
 
-        var currentTexture: MTLTexture = inputTexture
+        var currentTexture = inputImage.texture
         var currentImage: FabricImage? = nil
 
         for (index, step) in steps.enumerated() {
-            guard let nextImage = graphRenderer.newImage(withWidth: step.width, height: step.height) else {
-                currentImage?.release()
+            guard let nextImage = try? renderer.newImage(withWidth: step.width, height: step.height) else {
                 return nil
             }
 
-            commandBuffer.pushDebugGroup("\(self.name) - pass \(index)")
+            commandBuffer.pushDebugGroup("\(self.debugDescription) - pass \(index)")
 
             prepareStep(index, step)
 
-            self.postProcessor.mesh.preDraw = { renderEncoder in
-                renderEncoder.setFragmentTexture(currentTexture, index: FragmentTextureIndex.Custom0.rawValue)
-            }
+            let textureTransform = index == 0
+                ? inputImage.textureTransform
+                : matrix_identity_float4x4
+            let textureTransformBuffer = self.textureTransformBuffer(forStepIndex: index)
+            textureTransformBuffer.update(data: [textureTransform])
+            self.postMaterial.set(textureTransformBuffer, index: FragmentBufferIndex.Custom10)
 
-            self.postProcessor.renderer.size.width = Float(step.width)
-            self.postProcessor.renderer.size.height = Float(step.height)
+            self.postMaterial.set(currentTexture, index: FragmentTextureIndex.Custom0)
+
+            self.postProcessor.resize(size: (width: Float(step.width), height: Float(step.height)), scaleFactor: 1)
 
             let renderPassDescriptor = MTLRenderPassDescriptor()
             renderPassDescriptor.colorAttachments[0].texture = nextImage.texture
 
-            self.postProcessor.draw(renderPassDescriptor: renderPassDescriptor, commandBuffer: commandBuffer)
+            try self.postProcessor.draw(frame: executionInfo.timing, renderPassDescriptor: renderPassDescriptor, commandBuffer: commandBuffer)
 
-            currentImage?.release()
             currentImage = nextImage
             currentTexture = nextImage.texture
             

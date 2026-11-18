@@ -1,0 +1,49 @@
+//
+//  TypeAgnosticNode.swift
+//  Fabric
+//
+
+import Foundation
+import Satin
+import Metal
+
+// PortType already has a rawValue: String computed property, satisfying NodeStrategyOption.
+extension PortType: NodeStrategyOption {}
+
+/// Base class for nodes whose behavior is identical regardless of data type.
+/// The type picker is a practical concession to the type system, not a semantic choice.
+public class TypeAgnosticNode: StrategyNode
+{
+    /// When false, the strategy picker shows scalar element types only (no Array variants).
+    /// Set to false for nodes that operate on arrays structurally (Reverse, Shuffle, Subarray, Queue),
+    /// where the user picks the element type and the node creates typed array ports accordingly.
+    public class var includesArrayTypesInStrategy: Bool { true }
+
+    public override class var strategyOptions: [any NodeStrategyOption]
+    {
+        let includesArrayTypes = Self.includesArrayTypesInStrategy
+        var types: [PortType] = [.Virtual]
+        types += includesArrayTypes ? PortType.allCases.filter { $0 != .Virtual } : PortType.scalarCases
+        return types
+    }
+
+    public override class var separatorAfterFirstStrategy: Bool { true }
+
+    /// The currently active port type.
+    public var selectedPortType: PortType { strategyOption(as: PortType.self) ?? .Virtual }
+
+    /// Convenience programmatic init for a specific port type.
+    public convenience init(context: Context, portType: PortType)
+    {
+        self.init(context: context, strategy: portType)
+    }
+
+    /// Node-generated name: the selected port type leads the title, e.g. "Float
+    /// Sample and Hold" (NodeTitleView appends the type name after it). Virtual —
+    /// the no-configuration default — suppresses the token so the node reads as its
+    /// plain type name.
+    override public func deriveSubtitle() -> String? {
+        let portType = selectedPortType
+        return portType == .Virtual ? nil : portType.rawValue
+    }
+}

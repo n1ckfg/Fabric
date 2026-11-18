@@ -12,11 +12,11 @@ import Metal
 
 public class ScaleTransformNode : Node
 {
-    override public class var name:String { "Make Scale Transform" }
+    override public class var name:String { "Transform Scale" }
     override public class var nodeType:Node.NodeType { .Parameter(parameterType: .Transform) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
     override public class var nodeTimeMode: Node.TimeMode { .None }
-    override public class var nodeDescription: String { "Scale a Transform"}
+    override public class var nodeDescription: String { "Scale a transform"}
     
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -24,20 +24,22 @@ public class ScaleTransformNode : Node
         
         return ports +
         [
-            ("inputTransform", NodePort<simd_float4x4>(name: "Transform" , kind: .Inlet, description: "4x4 transform matrix to scale")),
-            ("inputScale", NodePort<simd_float3>(name: "Scale" , kind: .Inlet, description: "XYZ scale factors to apply")),
+            ("inputTransform", PortType.Transform.makeFreshPort(name: "Transform", kind: .Inlet, description: "4x4 transform matrix to scale")),
+            ("inputScale", ParameterPort(parameter: Float3Parameter("Scale", simd_float3(1, 1, 1), .inputfield, "XYZ scale factors to apply"))),
             ("outputTransform", NodePort<simd_float4x4>(name: "Transform" , kind: .Outlet, description: "Scaled 4x4 transform matrix")),
         ]
     }
-    
+
     // Port Proxy
     public var inputTransform:NodePort<simd_float4x4> { port(named: "inputTransform") }
-    public var inputScale:NodePort<simd_float3> { port(named: "inputScale") }
+    public var inputScale:ParameterPort<simd_float3> { port(named: "inputScale") }
     public var outputTransform:NodePort<simd_float4x4> { port(named: "outputTransform") }
     
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputScale.valueDidChange || self.inputTransform.valueDidChange,
            let inputTransform = self.inputTransform.value,

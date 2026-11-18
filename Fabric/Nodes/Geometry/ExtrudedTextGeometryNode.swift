@@ -13,6 +13,7 @@ import CoreText
 public class ExtrudedTextGeometryNode : BaseGeometryNode
 {
     public override class var name:String { "3D Text Geometry" }
+    public override class var nodeDescription: String { "Generates extruded 3D text geometry" }
 
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -21,6 +22,7 @@ public class ExtrudedTextGeometryNode : BaseGeometryNode
         return  [
         ("inputText", ParameterPort(parameter:StringParameter("Text", "Testing", .inputfield, "The text string to render as 3D extruded geometry"))),
         ("inputFont", ParameterPort(parameter:StringParameter("Font", "Helvetica", Self.installedFonts(), .dropdown, "Font family to use for text rendering"))),
+        ("inputPieceGeneration", ParameterPort(parameter:StringParameter("Pieces", TesselatedTextGeometry.PieceGeneration.none.menuTitle, TesselatedTextGeometry.PieceGeneration.menuTitles, .dropdown, "Divides the text into pieces, one per sentence, word or character, for Transform Pieces and Piece Info. None draws the text as one piece"))),
 
         ] + ports
     }
@@ -28,21 +30,22 @@ public class ExtrudedTextGeometryNode : BaseGeometryNode
     // Proxy Ports
     public var inputText:ParameterPort<String> { port(named: "inputText")  }
     public var inputFont:ParameterPort<String> { port(named: "inputFont")  }
+    public var inputPieceGeneration:ParameterPort<String> { port(named: "inputPieceGeneration")  }
     
     public override var geometry: ExtrudedTextGeometry { _geometry }
 
-    private let _geometry = ExtrudedTextGeometry(text: "Testing", fontSize: 1.0)
+    private lazy var _geometry = ExtrudedTextGeometry(context:self.context, text: "Testing", fontSize: 1.0)
 
-    override public func startExecution(context: GraphExecutionContext) {
-        super.startExecution(context: context)
-
+    override public func startExecution(renderer: GraphRenderer) throws
+    {
         if let fontParam = self.inputFont.parameter as? StringParameter
         {
             fontParam.options = Self.installedFonts()
         }
+        try super.startExecution(renderer: renderer)
     }
     
-    override public func evaluate(geometry: SatinGeometry, atTime: TimeInterval) -> Bool
+    override public func evaluate(geometry: Geometry, atTime: TimeInterval) -> Bool
     {
         var shouldOutputGeometry = super.evaluate(geometry: geometry, atTime: atTime)
 
@@ -57,6 +60,13 @@ public class ExtrudedTextGeometryNode : BaseGeometryNode
            let inputFont = self.inputFont.value
         {
             self.geometry.fontName = inputFont
+            shouldOutputGeometry = true
+        }
+
+        if self.inputPieceGeneration.valueDidChange,
+           let pieceGeneration = TesselatedTextGeometry.PieceGeneration(menuTitle: self.inputPieceGeneration.value)
+        {
+            self.geometry.pieceGeneration = pieceGeneration
             shouldOutputGeometry = true
         }
         

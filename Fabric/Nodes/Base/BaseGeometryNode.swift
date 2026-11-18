@@ -10,37 +10,38 @@ import Satin
 import simd
 import Metal
 
-public class BaseGeometryNode : Node
+/// Base implementation for geometry providers, including the standard Primitive
+/// input, Geometry output, and publication lifecycle.
+///
+/// External plug-ins can subclass this type, provide ``geometry``, and override
+/// ``execute(renderer:executionInfo:renderPassDescriptor:commandBuffer:)`` when
+/// they need specialized geometry work.
+open class BaseGeometryNode : Node
 {
-    override public class var name:String { "Geometry" }
-    override public class var nodeType:Node.NodeType { .Geometery }
-    override public class var nodeExecutionMode: Node.ExecutionMode { .Provider }
-    override public class var nodeTimeMode: Node.TimeMode { .None }
-    override public class var nodeDescription: String { "Provides \(Self.name)"}
+    override open class var name:String { "Geometry" }
+    override open class var nodeType:Node.NodeType { .Geometery }
+    override open class var nodeExecutionMode: Node.ExecutionMode { .Provider }
+    override open class var nodeTimeMode: Node.TimeMode { .None }
+    override open class var nodeDescription: String { "Provides \(Self.name)"}
 
-    override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
+    override open class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
         
         return ports +
         [
             ("inputPrimitiveType", ParameterPort(parameter:StringParameter("Primitive", "Triangle", ["Point", "Line", "Line Strip", "Triangle", "Triangle Strip"], .dropdown, "Rendering primitive type for the geometry mesh")) ),
-            ("outputGeometry",  NodePort<SatinGeometry>(name: "Geometry", kind: .Outlet, description: "The generated geometry mesh")),
+            ("outputGeometry",  NodePort<Geometry>(name: "Geometry", kind: .Outlet, description: "The generated geometry mesh")),
         ]
     }
     
     public var inputPrimitiveType: NodePort<String>   { port(named: "inputPrimitiveType") }
-    public var outputGeometry: NodePort<SatinGeometry>   { port(named: "outputGeometry") }
+    public var outputGeometry: NodePort<Geometry>   { port(named: "outputGeometry") }
 
-    open var geometry: SatinGeometry {
+    open var geometry: Geometry {
         fatalError("Subclasses must override geometry")
     }
-    
-    override public func startExecution(context:GraphExecutionContext)
-    {
-        self.geometry.context = self.context
-    }
-        
-    public func evaluate(geometry:SatinGeometry, atTime:TimeInterval) -> Bool
+            
+    public func evaluate(geometry:Geometry, atTime:TimeInterval) -> Bool
     {
         var shouldOutput = false
         
@@ -60,9 +61,9 @@ public class BaseGeometryNode : Node
         return shouldOutput
     }
     
-    public override func execute(context: GraphExecutionContext, renderPassDescriptor: MTLRenderPassDescriptor, commandBuffer: any MTLCommandBuffer)
+    override open func execute(renderer:GraphRenderer, executionInfo:GraphExecutionInfo, renderPassDescriptor: MTLRenderPassDescriptor, commandBuffer: MTLCommandBuffer) throws
     {
-        let shouldOutput = self.evaluate(geometry: self.geometry, atTime: context.timing.time)
+        let shouldOutput = self.evaluate(geometry: self.geometry, atTime: executionInfo.timing.time)
 
         if shouldOutput
         {
@@ -76,7 +77,8 @@ public class BaseGeometryNode : Node
         }
     }
     
-    internal func primitiveType() -> MTLPrimitiveType
+    /// Resolves the standard Primitive input to its Metal primitive type.
+    public func primitiveType() -> MTLPrimitiveType
     {
         switch self.inputPrimitiveType.value
         {

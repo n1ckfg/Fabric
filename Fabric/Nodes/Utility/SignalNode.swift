@@ -33,12 +33,14 @@ public class SignalNode : Node
     public var inputValue:NodePort<PortValue> { port(named: "inputValue") }
     public var outputSignal:NodePort<Bool> { port(named: "outputSignal") }
         
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         let signal = self.inputValue.valueDidChange
-        print("Signal \(signal)")
-        self.outputSignal.send(signal, force: true)
+        // Force to continue signalling when the input changes on successive frames
+        self.outputSignal.send(signal, force: signal)
     }
 }

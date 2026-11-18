@@ -12,7 +12,7 @@ import Metal
 import Satin
 import simd
 
-public class KeypointDistortNode: BaseEffectNode {
+public class KeypointDistortNode: BaseImageNode {
     // MARK: - UI & Type
     override public class var name: String { "Key Point Displacement" }
     override public class var nodeType: Node.NodeType { .Image(imageType: .Distort) }
@@ -20,7 +20,8 @@ public class KeypointDistortNode: BaseEffectNode {
     override public class var nodeTimeMode: Node.TimeMode { .None }
     override public class var nodeDescription: String { "Uses a pair of Reference Keypoints and Displaced Keypoints to Distort the Image." }
  
-    class override var sourceShaderName:String { "KeypointDistortShader" }
+    public override class var sourceShaderName:String { "KeypointDistortShader" }
+    public override class var defaultImageInputCountHint: Int? { 1 }
     
     // MARK: - Ports (Registry)
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -68,14 +69,12 @@ public class KeypointDistortNode: BaseEffectNode {
         self.countBuffer.update(data: [UInt32(0)])
     }
     
-    override public func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
-        guard let graphRenderer = context.graphRenderer,
-              let device = graphRenderer.device
-        else { return }
-        
         
         // If counts are diff, update backing
         if self.inputReferenceKeyPoints.valueDidChange,
@@ -83,7 +82,7 @@ public class KeypointDistortNode: BaseEffectNode {
         {
             if self.refKeyPointStructBuffer.count != inputReferenceKeyPoints.count {
                 
-                self.refKeyPointStructBuffer = StructBuffer<simd_float2>(device: device,
+                self.refKeyPointStructBuffer = StructBuffer<simd_float2>(device: renderer.context.device,
                                                                          count: inputReferenceKeyPoints.count,
                                                                          label: "Reference Keypoint Struct Buffer")
             }
@@ -97,7 +96,7 @@ public class KeypointDistortNode: BaseEffectNode {
         {
             if self.disKeyPointStructBuffer.count != inputDisplacedKeyPoints.count
             {
-                self.disKeyPointStructBuffer = StructBuffer<simd_float2>(device: device,
+                self.disKeyPointStructBuffer = StructBuffer<simd_float2>(device: renderer.context.device,
                                                                          count: inputDisplacedKeyPoints.count,
                                                                          label: "Displacement Keypoint Struct Buffer")
             }
@@ -105,37 +104,15 @@ public class KeypointDistortNode: BaseEffectNode {
             self.disKeyPointStructBuffer.update(data: inputDisplacedKeyPoints)
         }
         
-        if self.inputTexturePort.valueDidChange
-        {
-            if let inTex = self.inputTexturePort.value?.texture,
-               let outImage = context.graphRenderer?.newImage(withWidth: inTex.width, height: inTex.height)
-            {
-                let minCount = min (self.refKeyPointStructBuffer.count, self.disKeyPointStructBuffer.count)
-                self.countBuffer.update(data: [UInt32(minCount)] )
-                
-                self.postMaterial.set(self.refKeyPointStructBuffer, index: FragmentBufferIndex.Custom0)
-                self.postMaterial.set(self.disKeyPointStructBuffer, index: FragmentBufferIndex.Custom1)
-                self.postMaterial.set(self.countBuffer, index: FragmentBufferIndex.Custom2)
-                
-                self.postMaterial.set(inTex, index: FragmentTextureIndex.Custom0)
+        let minimumCount = min(self.refKeyPointStructBuffer.count, self.disKeyPointStructBuffer.count)
+        self.countBuffer.update(data: [UInt32(minimumCount)])
+        self.postMaterial.set(self.refKeyPointStructBuffer, index: FragmentBufferIndex.Custom0)
+        self.postMaterial.set(self.disKeyPointStructBuffer, index: FragmentBufferIndex.Custom1)
+        self.postMaterial.set(self.countBuffer, index: FragmentBufferIndex.Custom2)
 
-                    
-                self.postProcessor.renderer.size.width = Float(inTex.width)
-                self.postProcessor.renderer.size.height = Float(inTex.height)
-                
-                let renderPassDesc = MTLRenderPassDescriptor()
-                renderPassDesc.colorAttachments[0].texture = outImage.texture
-                
-                self.postProcessor.draw(renderPassDescriptor:renderPassDesc , commandBuffer: commandBuffer)
-
-                self.outputTexturePort.send( outImage )
-            }
-            else
-            {
-                self.outputTexturePort.send( nil )
-            }
-        }
-
-        
+        try super.execute(renderer: renderer,
+                          executionInfo: executionInfo,
+                          renderPassDescriptor: renderPassDescriptor,
+                          commandBuffer: commandBuffer)
     }
 }

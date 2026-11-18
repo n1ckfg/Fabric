@@ -11,32 +11,31 @@ import Satin
 import simd
 import Metal
 
-public class BaseObjectNode : Node
+open class BaseObjectNode : Node
 {
-    override public class var nodeExecutionMode: Node.ExecutionMode { .Consumer }
-    override public class var nodeTimeMode: Node.TimeMode { .None }
+    override open class var nodeExecutionMode: Node.ExecutionMode { .Consumer }
+    override open class var nodeTimeMode: Node.TimeMode { .None }
 
-    public func getObject() -> Object? {
+    open func getObject() -> Object? {
         return nil
     }
 }
 
 
-public class ObjectNode<ObjectType : Satin.Object> : BaseObjectNode
+open class ObjectNode<ObjectType : Satin.Object> : BaseObjectNode
 {
-    override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
+    override open class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
         
         return [
             ("inputVisible", ParameterPort(parameter:BoolParameter("Visible", true, .button, "When enabled, the object is rendered in the scene") ) ),
             ("inputRenderOrder", ParameterPort(parameter:IntParameter("Render Order", 0, .inputfield, "Draw order within the same render pass (lower = earlier)") ) ),
-            ("inputRenderPass", ParameterPort(parameter:IntParameter("Render Pass", 0, .inputfield, "Render pass index for multi-pass rendering") ) ),
 
             ("inputPosition", ParameterPort(parameter:Float3Parameter("Position", simd_float3(repeating:0), .inputfield, "Position in 3D space (X, Y, Z) in world units") ) ),
 
             ("inputScale", ParameterPort(parameter:Float3Parameter("Scale", simd_float3(repeating:1), .inputfield, "Scale factor along each axis (X, Y, Z)") ) ),
 
-            ("inputOrientation", ParameterPort(parameter:Float4Parameter("Orientation", simd_float4(repeating:0), .inputfield, "Rotation as quaternion (X, Y, Z, W)") ) ),
+            ("inputOrientation", ParameterPort(parameter:Float4Parameter("Orientation", simd_float4(repeating:0), .inputfield, "Orientation as quaternion (X, Y, Z, W)") ) ),
 
         ] + ports
     }
@@ -44,21 +43,20 @@ public class ObjectNode<ObjectType : Satin.Object> : BaseObjectNode
     // Port Proxy
     public var inputVisible:ParameterPort<Bool>    { port(named: "inputVisible") }
     public var inputRenderOrder:ParameterPort<Int>          { port(named: "inputRenderOrder") }
-    public var inputRenderPass:ParameterPort<Int>           { port(named: "inputRenderPass") }
     
     public var inputPosition:ParameterPort<simd_float3>          { port(named: "inputPosition") }
     public var inputScale:ParameterPort<simd_float3>          { port(named: "inputScale") }
     public var inputOrientation:ParameterPort<simd_float4>          { port(named: "inputOrientation") }
     
-    override public func getObject() -> Object? {
+    override open func getObject() -> Object? {
         return self.object
     }
-    
-    var object: ObjectType? {
+
+    open var object: ObjectType? {
         return nil
     }
 
-    public func evaluate(object:Object?, atTime:TimeInterval) -> Bool
+    open func evaluate(object:Object?, atTime:TimeInterval) -> Bool
     {
         var shouldOutput = false
         

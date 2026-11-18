@@ -1,0 +1,423 @@
+//
+//  LiveEffectNode.swift
+//  Fabric
+//
+//  Created by Codex on 3/4/26.
+//
+
+import Foundation
+import Metal
+import Satin
+import SwiftUI
+
+/// The settings of a Live Image node: its shader source.
+public struct LiveImageSettings: NodeSettings
+{
+    public var shaderSource: String
+
+    public init(shaderSource: String)
+    {
+        self.shaderSource = shaderSource
+    }
+
+    private enum CodingKeys: String, CodingKey
+    {
+        case shaderSource
+        case shaderSchemaVersion
+    }
+
+    private static let shaderSchemaVersion = 1
+
+    public init(from decoder: Decoder) throws
+    {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.shaderSource = try container.decode(String.self, forKey: .shaderSource)
+    }
+
+    public func encode(to encoder: Encoder) throws
+    {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(self.shaderSource, forKey: .shaderSource)
+        try container.encode(Self.shaderSchemaVersion, forKey: .shaderSchemaVersion)
+    }
+}
+
+public class LiveImageNode: BaseImageNode
+{
+    override public class var name: String { "Live Image" }
+    override public class var nodeType: Node.NodeType { .Image(imageType: .BaseEffect) }
+    override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
+    override public class var nodeTimeMode: Node.TimeMode { .None }
+    override public class var nodeDescription: String { "Live-editable Metal image effect with serialized shader source." }
+    override public class var defaultImageInputCountHint: Int? { 1 }
+
+    override public class var sourceShaderName: String { "LiveEffectDefaultShader" }
+
+    enum CodingKeys: String, CodingKey {
+        case shaderSource
+    }
+    private static let rootWorkspaceURL = URL(filePath: "/tmp/fabric-live-shaders", directoryHint: .isDirectory)
+    private static let staleWorkspaceTTL: TimeInterval = 24 * 60 * 60
+
+    private(set) var shaderSource: String = LiveImageNode.defaultShaderSource()
+    {
+        didSet { self.performOnMainAsync { [weak self] in self?._editorModelStorage?.refreshFromNode() } }
+    }
+
+    // A decoded copy of a node carries the document and node UUIDs of the
+    // original, so keying the workspace on those alone puts two live instances
+    // on one Shaders.metal whenever a document is decoded while the previous
+    // graph is alive (revert, reopen, round-trip test): each recompiles
+    // whatever the other last wrote, and whichever deinits first deletes the
+    // file from under the survivor. The document/node path stays for the stale
+    // workspace sweep to group by; this segment is what makes it exclusive.
+    private let workspaceInstanceID = UUID()
+
+    private var workspaceURL: URL?
+    private var shaderFileURL: URL?
+    private var workspaceError: (any Error)?
+    {
+        didSet { self.subtitleSubject.send() }
+    }
+
+    /// Set for the duration of super.init(from:) — see init(from:).
+    private var suppressesTemplateShaderPortSync = false
+
+    required init(context: Context, fileURL: URL) throws {
+        try super.init(context: context, fileURL: fileURL)
+        self.postInit()
+    }
+
+    required init(context: Context) {
+        super.init(context: context)
+        self.postInit()
+    }
+
+    public init(context: Context, settings: LiveImageSettings) {
+        self.shaderSource = settings.shaderSource
+        super.init(context: context)
+        self.postInit()
+    }
+
+    required init(from decoder: any Decoder) throws {
+        // The saved source is read before super.init so the port set can be
+        // built once, against the shader this node will actually run. Left to
+        // itself super.init synchronizes against the bundled template, and
+        // postInit then retargets and synchronizes again — every uniform port
+        // the template declares and the saved shader does not is created and
+        // destroyed on the way through, on every document open.
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.shaderSource = try container.decodeIfPresent(String.self, forKey: .shaderSource) ?? LiveImageNode.defaultShaderSource()
+        self.suppressesTemplateShaderPortSync = true
+
+        try super.init(from: decoder)
+
+        self.suppressesTemplateShaderPortSync = false
+
+        // The single sync: uniform ports the saved shader declares are created
+        // and adopt their persisted identity and state by registry key. On
+        // compile failure the document's own ports stand in — see
+        // recompileAndResyncPorts.
+        self.postInit()
+    }
+
+    override public func postSetupSynchronizePorts(allowReplace: Bool) {
+        guard self.suppressesTemplateShaderPortSync == false else { return }
+
+        super.postSetupSynchronizePorts(allowReplace: allowReplace)
+    }
+
+    deinit {
+        self.cleanupWorkspace()
+    }
+
+    override public func encode(to encoder: Encoder) throws {
+        try self.captureShaderSourceFromDiskIfAvailable()
+        try super.encode(to: encoder)
+    }
+
+    override public var settings: (any NodeSettings)? {
+        LiveImageSettings(shaderSource: self.shaderSource)
+    }
+
+    override public func apply(_ settings: any NodeSettings) {
+        guard let settings = settings as? LiveImageSettings else { return }
+        // An equal source would rewrite the file, recompile and resync ports for nothing.
+        self.performOnMainSync {
+            guard settings.shaderSource != self.shaderSource else { return }
+            self.updateShaderSource(settings.shaderSource)
+        }
+        super.apply(settings)
+    }
+
+    override public func providesSettingsView() -> Bool {
+        true
+    }
+
+    override public func settingsView() -> AnyView {
+        performOnMainSync { AnyView(LiveImageNodeSettingsView(editorModel: editorModel)) }
+    }
+
+    /// The editor's model, made on main when a view first asks for it and
+    /// kept, so a value applied under an open editor reaches it.
+    var editorModel: LiveImageNodeEditorModel {
+        performOnMainSync {
+            if let model = _editorModelStorage { return model }
+            let model = LiveImageNodeEditorModel(node: self)
+            _editorModelStorage = model
+            return model
+        }
+    }
+
+    private var _editorModelStorage: LiveImageNodeEditorModel?
+
+    override public var settingsSize: SettingsViewSize {
+        .Custom(size: CGSize(width: 900, height: 620))
+    }
+
+    @MainActor
+    func updateShaderSource(_ source: String) {
+        self.shaderSource = source
+        guard let shaderFileURL else { return }
+
+        do {
+            // Use non-atomic writes to preserve inode/watcher continuity for live recompiles.
+            try source.write(to: shaderFileURL, atomically: false, encoding: .utf8)
+            // A write that succeeds retires whatever the last one failed with.
+            // Nothing else clears this outside init, so without it one transient
+            // failure leaves the node refusing to run for the document's life.
+            self.workspaceError = nil
+            self.recompileAndResyncPorts()
+        }
+        catch {
+            self.workspaceError = error
+        }
+    }
+
+    /// The two ways this node cannot run: nowhere to keep the shader, or a
+    /// shader that will not compile. Both are already known — neither is stored
+    /// for the sake of the glyph.
+    override public func deriveStatuses() -> [NodeStatus] {
+        if let workspaceError = self.workspaceError {
+            return [.error("Live Image workspace is unavailable: \(workspaceError.localizedDescription)")]
+        }
+
+        if let shaderError = self.currentShaderErrorDescription() {
+            return [.error(shaderError)]
+        }
+
+        return []
+    }
+
+    public func currentShaderErrorDescription() -> String? {
+        guard let shader = self.postMaterial.shader as? SourceShader,
+              let error = shader.pipelineError else {
+            return nil
+        }
+
+        return error.localizedDescription
+    }
+
+    private func postInit() {
+        Self.sweepStaleWorkspacesOnceIfNeeded()
+
+        do {
+            let workspaceURL = try self.makeWorkspaceURL()
+            try self.ensureWorkspaceReady(at: workspaceURL)
+            self.workspaceURL = workspaceURL
+            self.shaderFileURL = workspaceURL.appending(path: "Shaders.metal")
+
+            try self.shaderSource.write(to: self.shaderFileURL!, atomically: true, encoding: .utf8)
+            self.retargetMaterial(to: self.shaderFileURL!)
+            self.recompileAndResyncPorts()
+            self.workspaceError = nil
+        }
+        catch {
+            self.workspaceError = error
+            self.adoptRemainingSnapshotPortsAsFallback()
+        }
+    }
+
+    private func makeWorkspaceURL() throws -> URL {
+        let documentID = self.graph?.id.uuidString ?? "unsaved-document"
+        let nodeID = self.id.uuidString
+        return Self.rootWorkspaceURL
+            .appending(path: documentID)
+            .appending(path: nodeID, directoryHint: .isDirectory)
+            .appending(path: self.workspaceInstanceID.uuidString, directoryHint: .isDirectory)
+    }
+
+    private func ensureWorkspaceReady(at workspaceURL: URL) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
+
+        let rootLygiaLink = Self.rootWorkspaceURL.appending(path: "lygia")
+        let localLygiaLink = workspaceURL.appending(path: "lygia")
+        let bundleLygia = Bundle.module.resourceURL?.appending(path: "lygia")
+
+        if let bundleLygia {
+            try self.ensureSymlink(at: rootLygiaLink, destination: bundleLygia)
+            try self.ensureSymlink(at: localLygiaLink, destination: bundleLygia)
+        }
+    }
+
+    private func ensureSymlink(at linkURL: URL, destination: URL) throws {
+        let fileManager = FileManager.default
+        let linkPath = linkURL.path(percentEncoded: false)
+
+        // Check the link itself first (lstat semantics): fileExists(atPath:)
+        // follows links, so a dangling link — every app update relocates the
+        // bundle it points into — reads as absent, the removal is skipped,
+        // and the create below throws "file exists".
+        if let existingDestination = try? fileManager.destinationOfSymbolicLink(atPath: linkPath) {
+            if existingDestination == destination.path(percentEncoded: false) {
+                return
+            }
+
+            try fileManager.removeItem(atPath: linkPath)
+        }
+        else if fileManager.fileExists(atPath: linkPath) {
+            var isDirectory = ObjCBool(false)
+            if fileManager.fileExists(atPath: linkPath, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return
+            }
+
+            try fileManager.removeItem(atPath: linkPath)
+        }
+
+        try fileManager.createSymbolicLink(at: linkURL, withDestinationURL: destination)
+    }
+
+    private func retargetMaterial(to shaderFileURL: URL) {
+        self.postMaterial.pipelineURL = shaderFileURL
+        self.postMaterial.live = true
+
+        if let sourceShader = self.postMaterial.shader as? SourceShader {
+            sourceShader.pipelineURL = shaderFileURL
+            sourceShader.live = true
+            sourceShader.setupShaderCompiler()
+        }
+    }
+
+    private func recompileAndResyncPorts() {
+        // Whether the shader compiled is the node's status, and it just changed.
+        defer { self.subtitleSubject.send() }
+
+        if let sourceShader = self.postMaterial.shader as? SourceShader {
+            sourceShader.reloadFromSource()
+
+            if sourceShader.pipelineError == nil {
+                self.postSetupSynchronizePorts(allowReplace: false)
+                return
+            }
+        }
+
+        // The saved shader declares the uniform ports; without a compiled one
+        // there is nothing to rebuild them from, so let the document's own
+        // stand in until the user fixes the source.
+        self.adoptRemainingSnapshotPortsAsFallback()
+    }
+
+    public override func execute(renderer: GraphRenderer,
+                                 executionInfo: GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
+    {
+        if let workspaceError
+        {
+            throw FabricError(.execution(.failed),
+                              severity: .recoverable,
+                              message: "Live Image workspace is unavailable",
+                              underlyingError: workspaceError)
+        }
+
+        if let shaderError = self.currentShaderErrorDescription()
+        {
+            throw FabricError(.execution(.syntax),
+                              severity: .recoverable,
+                              message: shaderError)
+        }
+
+        try super.execute(renderer: renderer,
+                          executionInfo: executionInfo,
+                          renderPassDescriptor: renderPassDescriptor,
+                          commandBuffer: commandBuffer)
+    }
+
+    private func captureShaderSourceFromDiskIfAvailable() throws {
+        guard let shaderFileURL,
+              FileManager.default.fileExists(atPath: shaderFileURL.path(percentEncoded: false)) else {
+            return
+        }
+
+        self.shaderSource = try String(contentsOf: shaderFileURL, encoding: .utf8)
+    }
+
+    private func cleanupWorkspace() {
+        guard let workspaceURL else { return }
+        try? FileManager.default.removeItem(at: workspaceURL)
+    }
+
+    private static func defaultShaderSource() -> String {
+        if let bundledTemplateURL = Bundle.module.url(forResource: Self.sourceShaderName, withExtension: "metal", subdirectory: "Shaders"),
+           let source = try? String(contentsOf: bundledTemplateURL, encoding: .utf8) {
+            return source
+        }
+
+        return """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        typedef struct {
+            float amount; // slider, 0.0, 1.0, 1.0, Amount
+        } PostUniforms;
+
+        fragment half4 postFragment(VertexData in [[stage_in]],
+                                    constant PostUniforms &uniforms [[buffer(FragmentBufferMaterialUniforms)]],
+                                    constant float4x4 *imageTransforms [[buffer(FragmentBufferCustom10)]],
+                                    texture2d<half, access::sample> inputTexture [[texture(FragmentTextureCustom0)]]) {
+            constexpr sampler s(address::clamp_to_edge, filter::linear);
+            float2 textureCoordinate = (imageTransforms[0] * float4(in.texcoord, 0.0, 1.0)).xy;
+            half4 color = inputTexture.sample(s, textureCoordinate);
+            return mix(half4(0.0), color, half(uniforms.amount));
+        }
+        """
+    }
+
+    private static func sweepStaleWorkspacesOnceIfNeeded() {
+        struct SweepState {
+            static var didSweep = false
+        }
+
+        guard SweepState.didSweep == false else { return }
+        SweepState.didSweep = true
+
+        let fileManager = FileManager.default
+        let root = Self.rootWorkspaceURL
+        guard fileManager.fileExists(atPath: root.path(percentEncoded: false)) else { return }
+
+        let expirationDate = Date().addingTimeInterval(-Self.staleWorkspaceTTL)
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey]
+
+        guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]) else {
+            return
+        }
+
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: keys),
+                  values.isDirectory == true,
+                  let modificationDate = values.contentModificationDate else {
+                continue
+            }
+
+            if modificationDate < expirationDate {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+    }
+}
+
+@available(*, deprecated, message: "Use LiveImageNode")
+public final class LiveEffectNode: LiveImageNode {}

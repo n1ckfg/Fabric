@@ -12,10 +12,10 @@ import simd
 import Metal
 
 
-public class BaseRenderableNode<ObjectType : Renderable> : ObjectNode<ObjectType>
+open class BaseRenderableNode<ObjectType : Renderable> : ObjectNode<ObjectType>
 {
-    
-    override public func evaluate(object:Object?, atTime:TimeInterval) -> Bool
+
+    override open func evaluate(object:Object?, atTime:TimeInterval) -> Bool
     {
         var shouldOutput = super.evaluate(object: object, atTime: atTime)
 
@@ -24,12 +24,6 @@ public class BaseRenderableNode<ObjectType : Renderable> : ObjectNode<ObjectType
         if self.inputRenderOrder.valueDidChange
         {
             renderable.renderOrder = self.inputRenderOrder.value ?? 0
-            shouldOutput = true
-        }
-        
-        if self.inputRenderPass.valueDidChange
-        {
-            renderable.renderPass = self.inputRenderPass.value ?? 0
             shouldOutput = true
         }
         

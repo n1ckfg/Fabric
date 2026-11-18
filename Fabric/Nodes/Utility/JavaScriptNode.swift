@@ -1,0 +1,847 @@
+//
+//  JavaScriptNode.swift
+//  Fabric
+//
+//  Created by Codex on 3/13/26.
+//
+
+import Foundation
+import JavaScriptCore
+import Metal
+import Satin
+import Synchronization
+import SwiftUI
+import simd
+
+public struct JavaScriptNodeDiagnostic: Hashable, Sendable
+{
+    public enum Severity: String, Codable, Hashable, Sendable
+    {
+        case error
+        case warning
+    }
+
+    public let line: Int
+    public let column: Int
+    public let severity: Severity
+    public let summary: String
+    public let detail: String
+
+    init(line: Int = 0,
+         column: Int = 0,
+         severity: Severity = .error,
+         summary: String,
+         detail: String = "")
+    {
+        self.line = line
+        self.column = column
+        self.severity = severity
+        self.summary = summary
+        self.detail = detail
+    }
+}
+
+private enum JavaScriptNodeExecutionError: LocalizedError
+{
+    case missingMainFunction
+    case invalidReturnShape
+    case extraOutput(String)
+    case invalidOutput(name: String, expected: String, returned: String)
+
+    var errorDescription: String?
+    {
+        switch self
+        {
+        case .missingMainFunction:
+            return "Compiled script does not define a callable `main` function."
+        case .invalidReturnShape:
+            return "JavaScript `main` must return an object containing the declared output values."
+        case .extraOutput(let key):
+            return "JavaScript returned undeclared output `\(key)`."
+        case .invalidOutput(let name, let expected, let returned):
+            return "Output `\(name)` is declared `\(expected)`, but the script returned \(returned)."
+        }
+    }
+}
+
+private protocol JavaScriptOpaqueValueBoxing
+{
+    var boxedPortValue: PortValue { get }
+}
+
+@objc private protocol JavaScriptExecutionContextExports: JSExport
+{
+    var time: Double { get }
+    var deltaTime: Double { get }
+    var displayTime: Double { get }
+    var systemTime: Double { get }
+    var frameNumber: Int { get }
+    var iterationIndex: Int { get }
+    var iterationCount: Int { get }
+}
+
+@objcMembers private final class JavaScriptExecutionContextValue: NSObject, JavaScriptExecutionContextExports
+{
+    let time: Double
+    let deltaTime: Double
+    let displayTime: Double
+    let systemTime: Double
+    let frameNumber: Int
+    let iterationIndex: Int
+    let iterationCount: Int
+
+    init(executionInfo: GraphExecutionInfo)
+    {
+        self.time = executionInfo.timing.time
+        self.deltaTime = executionInfo.timing.deltaTime
+        self.displayTime = executionInfo.timing.displayTime ?? executionInfo.timing.time
+        self.systemTime = executionInfo.timing.systemTime
+        self.frameNumber = executionInfo.timing.frameNumber
+        self.iterationIndex = executionInfo.iterationInfo?.currentIteration ?? 0
+        self.iterationCount = executionInfo.iterationInfo?.totalIterationCount ?? 1
+    }
+}
+
+@objc private protocol JavaScriptImageExports: JSExport
+{
+    var type: String { get }
+    var handleID: String { get }
+    var width: Double { get }
+    var height: Double { get }
+    var textureTransform: [Double] { get }
+    var pixelFormat: String { get }
+}
+
+@objcMembers private final class JavaScriptImageValue: NSObject, JavaScriptImageExports, JavaScriptOpaqueValueBoxing
+{
+    private let image: FabricImage
+
+    init(image: FabricImage)
+    {
+        self.image = image
+    }
+
+    var type: String { "Image" }
+    var handleID: String { image.id.uuidString }
+    var width: Double { image.presentationSize.width }
+    var height: Double { image.presentationSize.height }
+    var textureTransform: [Double] {
+        let matrix = image.textureTransform
+        return [
+            Double(matrix.columns.0.x), Double(matrix.columns.0.y), Double(matrix.columns.0.z), Double(matrix.columns.0.w),
+            Double(matrix.columns.1.x), Double(matrix.columns.1.y), Double(matrix.columns.1.z), Double(matrix.columns.1.w),
+            Double(matrix.columns.2.x), Double(matrix.columns.2.y), Double(matrix.columns.2.z), Double(matrix.columns.2.w),
+            Double(matrix.columns.3.x), Double(matrix.columns.3.y), Double(matrix.columns.3.z), Double(matrix.columns.3.w),
+        ]
+    }
+    var pixelFormat: String { String(describing: image.texture.pixelFormat) }
+    var boxedPortValue: PortValue { .Image(image) }
+}
+
+@objc private protocol JavaScriptGeometryExports: JSExport
+{
+    var type: String { get }
+    var handleID: String { get }
+    var vertexCount: Int { get }
+    var indexCount: Int { get }
+    var boundsMin: [Double] { get }
+    var boundsMax: [Double] { get }
+}
+
+@objcMembers private final class JavaScriptGeometryValue: NSObject, JavaScriptGeometryExports, JavaScriptOpaqueValueBoxing
+{
+    private let geometry: Satin.Geometry
+
+    init(geometry: Satin.Geometry)
+    {
+        self.geometry = geometry
+    }
+
+    var type: String { "Geometry" }
+    var handleID: String { String(ObjectIdentifier(geometry).hashValue) }
+    var vertexCount: Int { geometry.vertexCount }
+    var indexCount: Int { geometry.indexCount }
+    var boundsMin: [Double] { [Double(geometry.bounds.min.x), Double(geometry.bounds.min.y), Double(geometry.bounds.min.z)] }
+    var boundsMax: [Double] { [Double(geometry.bounds.max.x), Double(geometry.bounds.max.y), Double(geometry.bounds.max.z)] }
+    var boxedPortValue: PortValue { .Geometry(geometry) }
+}
+
+@objc private protocol JavaScriptMaterialExports: JSExport
+{
+    var type: String { get }
+    var handleID: String { get }
+    var label: String { get }
+    var hasShader: Bool { get }
+    var parameterCount: Int { get }
+    var blending: String { get }
+}
+
+@objcMembers private final class JavaScriptMaterialValue: NSObject, JavaScriptMaterialExports, JavaScriptOpaqueValueBoxing
+{
+    private let material: Satin.Material
+
+    init(material: Satin.Material)
+    {
+        self.material = material
+    }
+
+    var type: String { "Material" }
+    var handleID: String { String(ObjectIdentifier(material).hashValue) }
+    var label: String { material.label }
+    var hasShader: Bool { material.shader != nil }
+    var parameterCount: Int { material.parameters.params.count }
+    var blending: String { String(describing: material.blending) }
+    var boxedPortValue: PortValue { .Material(material) }
+}
+
+private final class JavaScriptValueBridge
+{
+    func javaScriptArgument(for boxedValue: PortValue?) -> Any
+    {
+        guard let boxedValue else { return NSNull() }
+
+        switch boxedValue
+        {
+        case .Bool(let value):
+            return value
+        case .Int(let value):
+            return value
+        case .Float(let value):
+            return Double(value)
+        case .String(let value):
+            return value
+        case .Vector2(let value):
+            return [Double(value.x), Double(value.y)]
+        case .Vector3(let value):
+            return [Double(value.x), Double(value.y), Double(value.z)]
+        case .Vector4(let value):
+            return [Double(value.x), Double(value.y), Double(value.z), Double(value.w)]
+        case .Quaternion(let value):
+            return [Double(value.vector.x), Double(value.vector.y), Double(value.vector.z), Double(value.vector.w)]
+        case .Transform(let value):
+            let column0 = value.columns.0
+            let column1 = value.columns.1
+            let column2 = value.columns.2
+            let column3 = value.columns.3
+            var values: [Double] = []
+            values.append(Double(column0.x))
+            values.append(Double(column0.y))
+            values.append(Double(column0.z))
+            values.append(Double(column0.w))
+            values.append(Double(column1.x))
+            values.append(Double(column1.y))
+            values.append(Double(column1.z))
+            values.append(Double(column1.w))
+            values.append(Double(column2.x))
+            values.append(Double(column2.y))
+            values.append(Double(column2.z))
+            values.append(Double(column2.w))
+            values.append(Double(column3.x))
+            values.append(Double(column3.y))
+            values.append(Double(column3.z))
+            values.append(Double(column3.w))
+            return values
+        case .Geometry(let value):
+            return JavaScriptGeometryValue(geometry: value)
+        case .Material(let value):
+            return JavaScriptMaterialValue(material: value)
+        case .Image(let value):
+            return JavaScriptImageValue(image: value)
+        case .Array(let values):
+            return values.map { javaScriptArgument(for: $0) }
+        case .Dictionary(let values):
+            return values.mapValues { javaScriptArgument(for: $0) }
+        }
+    }
+
+    func boxedValue(from value: JSValue?, as portType: PortType) -> PortValue?
+    {
+        guard let value, value.isUndefined == false, value.isNull == false else {
+            return nil
+        }
+
+        switch portType
+        {
+        case .Bool:
+            return value.toBool() ? .Bool(true) : .Bool(false)
+        case .Int:
+            return .Int(Int(value.toInt32()))
+        case .Float:
+            return .Float(Float(value.toDouble()))
+        case .String:
+            return .String(value.toString() ?? "")
+        case .Vector2:
+            guard let array = value.toArray() as? [Double], array.count == 2 else { return nil }
+            return .Vector2(simd_float2(Float(array[0]), Float(array[1])))
+        case .Vector3:
+            guard let array = value.toArray() as? [Double], array.count == 3 else { return nil }
+            return .Vector3(simd_float3(Float(array[0]), Float(array[1]), Float(array[2])))
+        case .Vector4, .Color:
+            guard let array = value.toArray() as? [Double], array.count == 4 else { return nil }
+            return .Vector4(simd_float4(Float(array[0]), Float(array[1]), Float(array[2]), Float(array[3])))
+        case .Quaternion:
+            guard let array = value.toArray() as? [Double], array.count == 4 else { return nil }
+            let vector = simd_float4(Float(array[0]), Float(array[1]), Float(array[2]), Float(array[3]))
+            return .Quaternion(simd_quatf(vector: vector))
+        case .Transform:
+            guard let array = value.toArray() as? [Double], array.count == 16 else { return nil }
+            return .Transform(simd_float4x4(columns: (
+                simd_float4(Float(array[0]), Float(array[1]), Float(array[2]), Float(array[3])),
+                simd_float4(Float(array[4]), Float(array[5]), Float(array[6]), Float(array[7])),
+                simd_float4(Float(array[8]), Float(array[9]), Float(array[10]), Float(array[11])),
+                simd_float4(Float(array[12]), Float(array[13]), Float(array[14]), Float(array[15]))
+            )))
+        case .Geometry, .Material, .Image:
+            return (value.toObject() as? JavaScriptOpaqueValueBoxing)?.boxedPortValue
+        case .NumericVirtual:
+            return nil
+        case .Virtual:
+            return nil
+        case .Array(portType: let elementType):
+            guard let array = value.toArray() else { return nil }
+            let boxedElements = array.compactMap { element -> PortValue? in
+                let wrappedValue = JSValue(object: element, in: value.context)
+                return boxedValue(from: wrappedValue, as: elementType)
+            }
+            guard boxedElements.count == array.count else { return nil }
+            return .Array(ContiguousArray(boxedElements))
+        case .Dictionary(valueType: let valueType):
+            guard let object = value.toDictionary() as? [String: Any] else { return nil }
+            var boxedValues: [String: PortValue] = [:]
+            boxedValues.reserveCapacity(object.count)
+
+            for (key, element) in object
+            {
+                let wrappedValue = JSValue(object: element, in: value.context)
+                guard let boxedValue = boxedValue(from: wrappedValue, as: valueType) else { return nil }
+                boxedValues[key] = boxedValue
+            }
+
+            return .Dictionary(boxedValues)
+        }
+    }
+}
+
+private final class JavaScriptNodeRuntime
+{
+    private let context: JSContext
+    private let mainFunction: JSValue
+    private let bridge = JavaScriptValueBridge()
+    private(set) var latestDiagnostic: JavaScriptNodeDiagnostic?
+
+    /// Outputs the last run declared but did not return a value this port could
+    /// hold. Not fatal — the script ran, and its other outputs are good — but
+    /// the author is the only one who can reconcile the two, so it is said.
+    private(set) var outputDiagnostics: [JavaScriptNodeDiagnostic] = []
+
+    init(signature: JavaScriptNodeSignature) throws
+    {
+        let context = JSContext()!
+        self.context = context
+        var capturedDiagnostic: JavaScriptNodeDiagnostic?
+
+        context.exceptionHandler = { _, exception in
+            capturedDiagnostic = JavaScriptNodeRuntime.makeDiagnostic(from: exception)
+        }
+
+        let console = JSValue(newObjectIn: context)
+        let logBlock: @convention(block) (JSValue) -> Void = { value in
+            print("JavaScriptNode:", value)
+        }
+        console?.setObject(logBlock, forKeyedSubscript: "log" as NSString)
+        context.setObject(console, forKeyedSubscript: "console" as NSString)
+
+        context.evaluateScript(signature.transpiledSource)
+        if let diagnostic = capturedDiagnostic {
+            self.latestDiagnostic = diagnostic
+            throw FabricError(.execution(.syntax),
+                              severity: .recoverable,
+                              message: diagnostic.summary)
+        }
+
+        guard let mainFunction = context.objectForKeyedSubscript("main"), mainFunction.isObject else {
+            throw JavaScriptNodeExecutionError.missingMainFunction
+        }
+
+        self.mainFunction = mainFunction
+
+        // Evaluating the source above happens before there is a `self` to record
+        // against, hence the local. Every exception after it is a running script's,
+        // and has to reach the instance for `execute` to report it. Weakly: the
+        // context holds the handler, and this holds the context.
+        context.exceptionHandler = { [weak self] _, exception in
+            self?.latestDiagnostic = JavaScriptNodeRuntime.makeDiagnostic(from: exception)
+        }
+    }
+
+    func execute(signature: JavaScriptNodeSignature,
+                 node: JavaScriptNode,
+                 executionInfo: GraphExecutionInfo) throws -> [String: PortValue?]
+    {
+        self.latestDiagnostic = nil
+        self.outputDiagnostics = []
+        self.context.exception = nil
+        self.context.setObject(JavaScriptExecutionContextValue(executionInfo: executionInfo), forKeyedSubscript: "context" as NSString)
+
+        let arguments = signature.inputs.map { definition in
+            bridge.javaScriptArgument(for: node.findPort(named: definition.name, as: Port.self)?.snapshotValue())
+        }
+
+        let result = self.mainFunction.call(withArguments: arguments)
+
+        // A script that throws returns nothing, so the exception has to be read
+        // before the result: a return-shape error inferred from the absence of a
+        // return names neither the failure nor the line it happened on.
+        if let diagnostic = self.latestDiagnostic {
+            throw FabricError(.execution(.syntax),
+                              severity: .recoverable,
+                              message: diagnostic.summary)
+        }
+
+        // A script that declares no outputs is written for its side effects, and
+        // has nothing to hand back. Reading a return out of one is the caller
+        // asking for what the signature already said does not exist.
+        guard signature.outputs.isEmpty == false else { return [:] }
+
+        guard let result, result.isObject else {
+            throw JavaScriptNodeExecutionError.invalidReturnShape
+        }
+
+        let objectValue = self.context.objectForKeyedSubscript("Object")
+        let keysValue = objectValue?.invokeMethod("keys", withArguments: [result])
+        let returnedKeys = Set((keysValue?.toArray() as? [String]) ?? [])
+        let declaredKeys = Set(signature.outputs.map(\.name))
+        if let unexpectedKey = returnedKeys.subtracting(declaredKeys).first {
+            throw JavaScriptNodeExecutionError.extraOutput(unexpectedKey)
+        }
+
+        var outputs: [String: PortValue?] = [:]
+        for definition in signature.outputs {
+            let outputValue = result.forProperty(definition.name)
+
+            // Undefined and null are a script declining to set an output this
+            // frame, which sends nothing and is nobody's mistake.
+            guard let outputValue,
+                  outputValue.isUndefined == false,
+                  outputValue.isNull == false
+            else {
+                outputs[definition.name] = nil
+                continue
+            }
+
+            // Anything else that will not box is the declared type and the
+            // returned value disagreeing. Sending nil for it and saying nothing
+            // leaves an author watching a port that never fires with no idea why.
+            guard let boxedValue = bridge.boxedValue(from: outputValue, as: definition.portType) else {
+                let expected = JavaScriptNodeSourceParser.typeScriptName(for: definition.portType)
+                    ?? definition.portType.rawValue
+                let error = JavaScriptNodeExecutionError.invalidOutput(name: definition.name,
+                                                                      expected: expected,
+                                                                      returned: Self.describe(outputValue))
+                let summary = error.errorDescription ?? "Output `\(definition.name)` will not box."
+                self.outputDiagnostics.append(JavaScriptNodeDiagnostic(severity: .warning,
+                                                                       summary: summary,
+                                                                       detail: summary))
+                outputs[definition.name] = nil
+                continue
+            }
+
+            outputs[definition.name] = boxedValue
+        }
+        return outputs
+    }
+
+    /// What came back, from JavaScript's side of the bridge. An array's count is
+    /// worth carrying: a `Vector3` that arrives two long is the common
+    /// version of this mistake, and the count is the whole of the explanation.
+    private static func describe(_ value: JSValue) -> String
+    {
+        if value.isBoolean { return "a boolean" }
+        if value.isNumber { return "a number" }
+        if value.isString { return "a string" }
+        if value.isArray
+        {
+            let count = Int(value.forProperty("length")?.toInt32() ?? 0)
+            return count == 1 ? "an array of 1 value" : "an array of \(count) values"
+        }
+        if value.isObject { return "an object" }
+        return "a value it cannot box"
+    }
+
+    private static func makeDiagnostic(from exception: JSValue?) -> JavaScriptNodeDiagnostic
+    {
+        guard let exception else {
+            return JavaScriptNodeDiagnostic(summary: "Unknown JavaScript error.")
+        }
+
+        let summary = exception.toString() ?? "Unknown JavaScript error."
+        let line = Int(exception.forProperty("line")?.toInt32() ?? 1) - 1
+        let column = Int(exception.forProperty("column")?.toInt32() ?? 1) - 1
+        return JavaScriptNodeDiagnostic(line: max(0, line),
+                                        column: max(0, column),
+                                        summary: summary,
+                                        detail: summary)
+    }
+}
+
+/// The settings of a JavaScript node: its script and its time mode, which the
+/// script's signature does not declare.
+public struct JavaScriptSettings: NodeSettings
+{
+    public var scriptSource: String
+    public var selectedTimeMode: Node.TimeMode
+
+    public init(scriptSource: String, selectedTimeMode: Node.TimeMode)
+    {
+        self.scriptSource = scriptSource
+        self.selectedTimeMode = selectedTimeMode
+    }
+
+    private enum CodingKeys: String, CodingKey
+    {
+        case scriptSource
+        case selectedTimeMode
+        case scriptSchemaVersion
+    }
+
+    private static let scriptSchemaVersion = 1
+
+    public init(from decoder: Decoder) throws
+    {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.scriptSource = try container.decode(String.self, forKey: .scriptSource)
+        self.selectedTimeMode = try container.decodeIfPresent(Node.TimeMode.self, forKey: .selectedTimeMode) ?? .None
+    }
+
+    public func encode(to encoder: Encoder) throws
+    {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(self.scriptSource, forKey: .scriptSource)
+        try container.encode(self.selectedTimeMode, forKey: .selectedTimeMode)
+        try container.encode(Self.scriptSchemaVersion, forKey: .scriptSchemaVersion)
+    }
+}
+
+public final class JavaScriptNode: Node
+{
+    override public class var name: String { "JavaScript" }
+    override public class var nodeType: Node.NodeType { .Utility }
+    override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
+    override public class var nodeTimeMode: Node.TimeMode { .None }
+    override public class var nodeDescription: String { "Live-editable QC-style JavaScript logic node with dynamic Fabric ports." }
+
+    private enum CodingKeys: String, CodingKey
+    {
+        case scriptSource
+        case selectedTimeMode
+    }
+
+    @ObservationIgnored private(set) var scriptSource: String = JavaScriptNode.defaultScriptSource()
+    {
+        didSet { self.performOnMainAsync { [weak self] in self?._editorModelStorage?.refreshFromNode() } }
+    }
+    @ObservationIgnored private var compiledSignature: JavaScriptNodeSignature?
+    @ObservationIgnored private var runtime: JavaScriptNodeRuntime?
+    /// What the script last had to say about itself. `execute` writes this from
+    /// the renderer thread, and the canvas reads it on the main thread through
+    /// `deriveStatuses` — as does the settings panel — so every access to the
+    /// array itself goes through the lock.
+    private let diagnosticsState = Mutex<[JavaScriptNodeDiagnostic]>([])
+
+    private var diagnostics: [JavaScriptNodeDiagnostic]
+    {
+        get { self.diagnosticsState.withLock { $0 } }
+        set
+        {
+            let changed = self.diagnosticsState.withLock { state in
+                guard state != newValue else { return false }
+                state = newValue
+                return true
+            }
+
+            // Sent with the lock given up, and not only to keep a frame off the
+            // canvas's wake: a subscriber's first move is to read the statuses
+            // back, and this lock is not recursive.
+            if changed { self.subtitleSubject.send() }
+        }
+    }
+
+    public private(set) var selectedTimeMode: Node.TimeMode = .None
+    {
+        didSet { self.performOnMainAsync { [weak self] in self?._editorModelStorage?.refreshFromNode() } }
+    }
+
+    /// The role the signature puts the node in, on the same reading of it that
+    /// gives the node its ports. A script with nothing to return is a script
+    /// written for its side effects: nothing downstream will ask it for a value,
+    /// so only a Consumer — a root the renderer pulls — ever runs it at all. One
+    /// that takes nothing produces from time or the outside, which is a Provider.
+    /// Anything with both is a Processor, the ordinary case.
+    ///
+    /// Derived rather than picked because the signature already says it, and two
+    /// places to say the same thing is one place for them to disagree: a
+    /// consumer-style script left on the Processor a picker defaulted to is a
+    /// node that never runs and never says why. Both lists are the node's cached
+    /// topology, so this costs nothing to read per frame.
+    @ObservationIgnored override public var nodeExecutionMode: ExecutionMode
+    {
+        guard self.outputPorts().isEmpty == false else { return .Consumer }
+        return self.inputPorts().isEmpty ? .Provider : .Processor
+    }
+
+    @ObservationIgnored override public var nodeTimeMode: TimeMode { self.selectedTimeMode }
+
+    var currentDiagnostics: [JavaScriptNodeDiagnostic] { diagnostics }
+
+    /// What the script has to say about itself is the node's status, so a script
+    /// that will not compile or threw last frame says so on the canvas rather
+    /// than only inside its settings.
+    override public func deriveStatuses() -> [NodeStatus]
+    {
+        self.diagnostics.map { diagnostic in
+            diagnostic.severity == .warning ? .warning(diagnostic.summary)
+                                            : .error(diagnostic.summary)
+        }
+    }
+
+    public required init(context: Context)
+    {
+        super.init(context: context)
+        self.compileAndSynchronizePorts()
+    }
+
+    public init(context: Context, settings: JavaScriptSettings)
+    {
+        self.scriptSource = settings.scriptSource
+        self.selectedTimeMode = settings.selectedTimeMode
+        super.init(context: context)
+        self.compileAndSynchronizePorts()
+    }
+
+    public required init(from decoder: any Decoder) throws
+    {
+        try super.init(from: decoder)
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.scriptSource = try container.decodeIfPresent(String.self, forKey: .scriptSource) ?? JavaScriptNode.defaultScriptSource()
+        self.selectedTimeMode = try container.decodeIfPresent(Node.TimeMode.self, forKey: .selectedTimeMode) ?? .None
+        // Every port is dynamic, so decode must rebuild them from the restored
+        // script; each recreated port adopts its persisted identity and state
+        // by registry key as it registers.
+        self.compileAndSynchronizePorts()
+    }
+
+    override public var settings: (any NodeSettings)?
+    {
+        JavaScriptSettings(scriptSource: self.scriptSource, selectedTimeMode: self.selectedTimeMode)
+    }
+
+    override public func apply(_ settings: any NodeSettings)
+    {
+        guard let settings = settings as? JavaScriptSettings else { return }
+        self.performOnMainSync {
+            if settings.scriptSource != self.scriptSource { self.updateScriptSource(settings.scriptSource) }
+            self.updateTimeMode(settings.selectedTimeMode)
+        }
+        super.apply(settings)
+    }
+
+    override public func providesSettingsView() -> Bool
+    {
+        true
+    }
+
+    override public func settingsView() -> AnyView
+    {
+        performOnMainSync { AnyView(JavaScriptNodeSettingsView(editorModel: editorModel)) }
+    }
+
+    /// The editor's model, made on main when a view first asks for it and
+    /// kept, so a value applied under an open editor reaches it.
+    var editorModel: JavaScriptNodeEditorModel
+    {
+        performOnMainSync
+        {
+            if let model = _editorModelStorage { return model }
+            let model = JavaScriptNodeEditorModel(node: self)
+            _editorModelStorage = model
+            return model
+        }
+    }
+
+    private var _editorModelStorage: JavaScriptNodeEditorModel?
+
+    override public var settingsSize: SettingsViewSize
+    {
+        .Custom(size: CGSize(width: 980, height: 700))
+    }
+
+    @MainActor
+    func updateScriptSource(_ source: String)
+    {
+        self.scriptSource = source
+        self.compileAndSynchronizePorts()
+    }
+
+    /// The execution mode is read off the ports and has no setter. The time
+    /// mode is not declared by the script, so it has one.
+    @MainActor
+    func updateTimeMode(_ timeMode: Node.TimeMode)
+    {
+        guard self.selectedTimeMode != timeMode else { return }
+        self.selectedTimeMode = timeMode
+        self.markDirty()
+    }
+
+    override public func execute(renderer: GraphRenderer,
+                                 executionInfo: GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
+    {
+        guard let compiledSignature,
+              let runtime else
+        {
+            if let diagnostic = self.diagnostics.first
+            {
+                throw FabricError(.execution(.syntax),
+                                  severity: .recoverable,
+                                  message: diagnostic.summary)
+            }
+
+            return
+        }
+
+        do {
+            let outputValues = try runtime.execute(signature: compiledSignature, node: self, executionInfo: executionInfo)
+            self.diagnostics = runtime.outputDiagnostics
+
+            for definition in compiledSignature.outputs {
+                guard let port = self.findPort(named: definition.name) else { continue }
+                port.sendBoxed(outputValues[definition.name] ?? nil, force: true)
+            }
+        }
+        catch {
+            let summary = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            // The runtime's own diagnostic carries the line and column the
+            // exception reported; one rebuilt from the error text points at the
+            // script's first character instead.
+            self.diagnostics = [runtime.latestDiagnostic
+                                ?? JavaScriptNodeDiagnostic(summary: summary, detail: summary)]
+            throw FabricError(.execution(.syntax),
+                              severity: .recoverable,
+                              message: summary,
+                              underlyingError: error)
+        }
+    }
+
+    private func compileAndSynchronizePorts()
+    {
+        // A new runtime means whatever the node last sent came from a script it
+        // no longer runs. Nothing upstream of an edit moves, and a Processor that
+        // is not dirty is skipped, so without this the edit takes effect only
+        // once something else in the graph happens to.
+        self.markDirty()
+
+        // Read before the ports move, compared after: the mode is derived from
+        // them, and Consumers are the roots the execution plan is pulled from.
+        let previousExecutionMode = self.nodeExecutionMode
+        defer
+        {
+            // That plan is cached until the graph's execution topology generation
+            // moves, and an edit does not move it. A script that becomes a
+            // Consumer has to be a root to be executed at all, and one that stops
+            // being a Consumer has to stop being one.
+            if self.nodeExecutionMode != previousExecutionMode
+            {
+                self.graph?.markExecutionTopologyChanged()
+            }
+        }
+
+        do {
+            let signature = try JavaScriptNodeSourceParser.parse(source: self.scriptSource)
+            let runtime = try JavaScriptNodeRuntime(signature: signature)
+
+            // A script written in the annotated form is kept as the TypeScript
+            // it was read as, so a document carries one syntax however it was
+            // written.
+            if signature.canonicalSource != self.scriptSource
+            {
+                self.scriptSource = signature.canonicalSource
+            }
+
+            self.compiledSignature = signature
+            self.runtime = runtime
+            self.diagnostics = []
+
+            self.synchronizeDynamicPorts(with: signature)
+        }
+        catch {
+            let summary = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            self.diagnostics = [JavaScriptNodeDiagnostic(summary: summary, detail: summary)]
+
+            // The script that no longer compiles is the one this node runs.
+            // Holding on to the last runtime that did has the node go on emitting
+            // from a script the editor no longer shows, and the next clean run
+            // clears the compile error along with it. `execute` throws this
+            // diagnostic for as long as there is nothing to run, as
+            // MathExpressionNode's does. The ports are left where they are:
+            // every one of them came from the last signature that parsed, and a
+            // half-typed script is no reason to take an author's wires down.
+            self.compiledSignature = nil
+            self.runtime = nil
+
+            // Every port here is minted from the script's signature, so a saved
+            // script that no longer parses leaves the node with none at all.
+            self.adoptRemainingSnapshotPortsAsFallback()
+        }
+    }
+
+    private func synchronizeDynamicPorts(with signature: JavaScriptNodeSignature)
+    {
+        let desiredPorts = signature.inputs + signature.outputs
+        let desiredNames = Set(desiredPorts.map(\.name))
+
+        for port in self.ports where !desiredNames.contains(port.name) {
+            self.removePort(port)
+        }
+
+        var reorderedPorts: [Port] = []
+        for definition in desiredPorts {
+            let expectedKind: PortKind = definition.direction == .input ? .Inlet : .Outlet
+
+            if let existingPort = self.findPort(named: definition.name, as: Port.self),
+               existingPort.kind == expectedKind,
+               existingPort.portType == definition.portType
+            {
+                reorderedPorts.append(existingPort)
+                continue
+            }
+
+            if let existingPort = self.findPort(named: definition.name, as: Port.self) {
+                let replacement = definition.portType.makeFreshPort(name: definition.name, kind: expectedKind, id: existingPort.id)
+                self.replacePort(existingPort, with: replacement)
+                reorderedPorts.append(replacement)
+            } else {
+                let added = definition.portType.makeFreshPort(name: definition.name, kind: expectedKind)
+                self.addDynamicPort(added, name: definition.name)
+                reorderedPorts.append(added)
+            }
+        }
+
+        self.reorderPorts(reorderedPorts)
+    }
+
+    private static func defaultScriptSource() -> String
+    {
+        """
+        function main(a: Number, b: Number, threshold: Number): { sum: Number, thresholdPassed: Bool } {
+          const total = a + b
+          return {
+            sum: total,
+            thresholdPassed: total > threshold
+          }
+        }
+        """
+    }
+}

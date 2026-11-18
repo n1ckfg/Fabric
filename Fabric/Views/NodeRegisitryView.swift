@@ -10,29 +10,52 @@ import Satin
 
 public struct NodeRegisitryView: View {
 
-    public let graph: Graph
+    public let graphRenderer: GraphRenderer
+    public let editingContext: GraphCanvasContext
+
+    /// The editor-wide focus state. The search field binds to `.registrySearch`
+    /// and the list to `.registryList`, so "search focused" is read from real
+    /// focus rather than a locally-shadowed Bool.
+    private let focus: FocusState<FabricEditorFocusTarget?>.Binding
 
     @State private var searchString:String = ""
     @State private var selection = Set<UUID>()
     @State private var headerSelection: Node.NodeTypeGroups = .All
 
-    // These are computed properties in an effort to avoid race conditions on multiple states
-    private var filteredNodesForTypes: [Node.NodeType:[NodeClassWrapper]] {
-        Dictionary(uniqueKeysWithValues: Node.NodeType.allCases.map { t in (t, self.filteredNodes(forType: t)) })
-    }
+    private var isSearchFocused: Bool { self.focus.wrappedValue == .registrySearch }
 
-    private var numNodesToShow: Int {
-        self.headerSelection.nodeTypes().flatMap { self.filteredNodes(forType: $0) }.count
-    }
+
+    @State private var filteredNodesForTypes: [Node.NodeType:[NodeClassWrapper]] = [:]
+    @State private var filteredNodes: [NodeClassWrapper] = []
+
+
+    /// Flat ordered list of currently visible nodes, respecting header filter and search.
+    ///
+    /// SwiftUI's List handles arrow-key navigation internally, but only when the List itself
+    /// holds keyboard focus. Our UX requires the search field to retain focus for typing while
+    /// arrow keys simultaneously navigate the list. List exposes no API to drive selection
+    /// externally (no moveSelectionDown(), no ordered-item query, no "select first" command),
+    /// and it silently retains stale UUIDs in the selection binding when items leave the data
+    /// source. This property bridges that gap — it gives us the ordered item list needed by
+    /// selectFirstNode(), moveSelection(by:), selection reconciliation after filtering,
+    /// and the "No Results Found" overlay (via numNodesToShow / haveNodesToShow).
+    /// When the List has focus (e.g. after a click), its native keyboard handling takes over
+    /// and these helpers are bypassed via the isSearchFocused guard.
+
+    private var numNodesToShow: Int { self.filteredNodes.count }
 
     private var haveNodesToShow: Bool { self.numNodesToShow > 0 }
-    
-    public init(graph: Graph) {
-        self.graph = graph
+
+    public init(graphRenderer:GraphRenderer, editingContext: GraphCanvasContext, focus: FocusState<FabricEditorFocusTarget?>.Binding) {
+        self.graphRenderer = graphRenderer
+        self.editingContext = editingContext
+        self.focus = focus
     }
     
     public var body: some View
     {
+        let nodeTypes = self.headerSelection.nodeTypes()
+        
         VStack(spacing: 0)
         {
             Divider()
@@ -45,67 +68,82 @@ public struct NodeRegisitryView: View {
 
             Divider()
 
-            List(selection:$selection)
-            {
-                ForEach(self.headerSelection.nodeTypes(), id: \.self) { nodeType in
-                    
-                    if let filteredNodesForType:[NodeClassWrapper] = self.filteredNodesForTypes[nodeType],
-                       filteredNodesForType.isEmpty == false
-                    {
-                        Section(header: Text("\(nodeType)")) {
-                            ForEach(filteredNodesForType, id: \.id) { node in
-                                Text(node.nodeName)
+            ScrollViewReader { listProxy in
+                List(selection:$selection)
+                {
+                    ForEach(nodeTypes, id: \.self) { nodeType in
+
+                        if let filteredNodesForType:[NodeClassWrapper] = self.filteredNodesForTypes[nodeType],
+                           filteredNodesForType.isEmpty == false
+                        {
+                            Section(header: Text("\(nodeType)")) {
+                                ForEach(filteredNodesForType) { node in
+                                    VStack(alignment: .leading, spacing: 4)
+                                    {
+                                        Text(node.nodeName)
+                                            .font( .system(size: 11) )
+                                        
+                                        if self.selection.contains(node.id)
+                                        {
+                                            Text(node.nodeDescription)
+                                                .font( .system(size: 10) )
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(nil)
+                                        }
+                                    }
                                     .tag(node.id)
-                                    .font( .system(size: 11) )
+                                    .id(node.id)
+                                    .draggable(NodeRegistryDragData(wrapperID: node.id))
+                                }
                             }
                         }
                     }
                 }
-            }
-            // Below replaces the onTap action that was on the list item
-            // This affords double click to add / return to add
-            // * Single click to select
-            // * Multi Select
-            // * Type to select
-            // * Arrow navigation
-            // Weird that its a context menu filter! But whatever.
-            // This fixes #114 - Anton
-            .contextMenu(forSelectionType: UUID.self)
-            { items in
-                
-                // No context menu ever
-                EmptyView()
-                
-            } primaryAction: { selection in
-
-                for nodeID in selection
+                .focused(focus, equals: .registryList)
+                .onAppear()
                 {
-                    if let node = NodeRegistry.shared.availableNodes.first(where: { $0.id == nodeID })
+                    self.updateFilteredNodes()
+                }
+            
+                // Below replaces the onTap action that was on the list item
+                // This affords double click to add / return to add
+                // * Single click to select
+                // * Multi Select
+                // * Type to select
+                // * Arrow navigation
+                // Weird that its a context menu filter! But whatever.
+                // This fixes #114 - Anton
+                .contextMenu(forSelectionType: UUID.self)
+                { items in
+
+                    // No context menu ever
+                    EmptyView()
+
+                } primaryAction: { _ in
+                    self.addSelectedNodes()
+                }
+                .overlay
+                {
+                    VStack(spacing:0)
                     {
-                        do
-                        {
-                            try self.graph.addNode(node)
-                        }
-                        catch
-                        {
-                            print("Unable to add node:\(node)")
+                        Spacer()
+
+                        Text("No Results Found")
+                            .font( .headline)
+                            .foregroundStyle(.secondary)
+
+                        Spacer()
+                    }
+                    .opacity( self.haveNodesToShow ? 0.0 : 1.0 )
+                }
+                .onChange(of: self.selection) { _, newSelection in
+                    if let id = newSelection.first
+                    {
+                        withAnimation {
+                            listProxy.scrollTo(id)
                         }
                     }
                 }
-            }
-            .overlay
-            {
-                VStack(spacing:0)
-                {
-                    Spacer()
-                    
-                    Text("No Results Found")
-                        .font( .headline)
-                        .foregroundStyle(.secondary)
-                    
-                    Spacer()
-                }
-                .opacity( self.haveNodesToShow ? 0.0 : 1.0 )
             }
             
 //            Divider()
@@ -113,27 +151,37 @@ public struct NodeRegisitryView: View {
 //            Spacer()
         }
         .searchable(text: $searchString, placement: .sidebar)
+        .searchFocused(focus, equals: .registrySearch)
         .searchPresentationToolbarBehavior(.avoidHidingContent)
-
-
-        
-        // It seems as though our custom search bar vs .searchable behave slightly differently?
-        // Not sure why that is!?
-//        .safeAreaInset(edge: .bottom) {
-//            self.searchBar()
-//        }
-//        .onChange(of: self.searchString) { _, _ in
-//            self.selection.removeAll()
-//        }
-//        .onChange(of: self.headerSelection) { _, _ in
-//            self.selection.removeAll()
-//        }
-//        .onAppear()
-//        {
-//            // not the best..
-//            self.numNodesToShow = self.calcNumTotalNodes()
-//            self.filteredNodesForTypes = self.calcFilteredNodesDict()
-//        }
+        .onChange(of: self.searchString) { _, _ in
+            self.updateFilteredNodesAndSelection()
+        }
+        .onChange(of: self.headerSelection) { _, _ in
+            self.updateFilteredNodesAndSelection()
+        }
+        .onChange(of: self.isSearchFocused) { _, focused in
+            if focused, self.selection.isEmpty
+            {
+                self.selectFirstNode()
+            }
+        }
+        // Manual key handling for search-focused mode. When the List has focus these return
+        // .ignored, letting the List's native arrow navigation and primaryAction take over.
+        .onKeyPress(.upArrow) {
+            guard self.isSearchFocused else { return .ignored }
+            self.moveSelection(by: -1)
+            return .handled
+        }
+        .onKeyPress(.downArrow) {
+            guard self.isSearchFocused else { return .ignored }
+            self.moveSelection(by: 1)
+            return .handled
+        }
+        .onKeyPress(.return) {
+            guard self.isSearchFocused, !self.selection.isEmpty else { return .ignored }
+            self.addSelectedNodes()
+            return .handled
+        }
     }
     
     @ViewBuilder private func headerBar() -> some View
@@ -144,51 +192,109 @@ public struct NodeRegisitryView: View {
             
             ForEach(Node.NodeTypeGroups.allCases, id: \.self) { nodeGroup in
                 
-                nodeGroup.image()
+                Button(nodeGroup.rawValue, systemImage: nodeGroup.imageName()) {
+                    self.headerSelection = nodeGroup
+                    self.focus.wrappedValue = .registrySearch
+                }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.plain)
                     .foregroundStyle( nodeGroup == headerSelection ? Color.accentColor : Color.secondary.opacity(0.5))
                     .tag(nodeGroup)
                     .help(nodeGroup.rawValue)
-                    .onTapGesture {
-                        self.headerSelection = nodeGroup
-                    }
             }
             
             Spacer()
         }
     }
     
-    @ViewBuilder private func searchBar() -> some View
+    private func updateFilteredNodesAndSelection()
     {
-        VStack(spacing:0)
-        {
-            HStack
-            {
-                Spacer()
+        self.updateFilteredNodes()
 
-                TextField("Search", text: $searchString)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .controlSize(.small)
-                Spacer()
-                
-                Image(systemName: "xmark.circle")
-                    .foregroundStyle(Color.secondary.opacity(0.5))
-                    .onTapGesture {
-                        self.searchString = ""
-                    }
-                
-                Spacer()
-            }
-            
-            Text(String( self.numNodesToShow ) + " Nodes")
-                .font( .caption )
-                .padding(.vertical, 3)
+        let visibleNodeIDs = Set(self.filteredNodes.map(\.id))
+        self.selection.formIntersection(visibleNodeIDs)
+
+        if self.selection.isEmpty
+        {
+            self.selectFirstNode()
         }
     }
+
+    private func updateFilteredNodes()
+    {
+        let filterResults = self.headerSelection.nodeTypes().map { t in (t, self.filteredNodes(forType: t)) }
+        
+        self.filteredNodesForTypes = Dictionary(uniqueKeysWithValues:filterResults )
+        
+        self.filteredNodes = filterResults.flatMap { $0.1 }
+
+        // This would be nice but dictionary is unordered :(
+//        self.filteredNodes = self.filteredNodesForTypes.values.flatMap( { $0} ).compactMap( { $0 } )
+
+    }
     
+    private func addSelectedNodes()
+    {
+        for nodeID in self.selection
+        {
+            if let nodeWrapper = try? NodeRegistry.shared.availableNodes.first(where: { $0.id == nodeID })
+            {
+                 do
+                 {
+                     let node = try nodeWrapper.initializeNode(context: self.graphRenderer.context)
+                     
+                     try self.editingContext.layoutNode(node)
+
+                     self.editingContext.currentGraph.addNode(node)
+                 }
+                 catch
+                 {
+                     print("Unable to add node:\(nodeWrapper)")
+                 }
+            }
+        }
+        // Hand keyboard focus to the canvas so the freshly added node can be
+        // arrow-key navigated immediately.
+        self.focus.wrappedValue = .canvas
+    }
+
+    private func selectFirstNode()
+    {
+        if let first = self.filteredNodes.first
+        {
+            self.selection = [first.id]
+        }
+        else
+        {
+            self.selection.removeAll()
+        }
+    }
+
+    private func moveSelection(by offset: Int)
+    {
+        let nodes = self.filteredNodes
+        guard !nodes.isEmpty else { return }
+
+        let currentID = self.selection.first
+        let currentIndex = currentID.flatMap { id in nodes.firstIndex(where: { $0.id == id }) }
+        let newIndex: Int
+
+        if let currentIndex
+        {
+            newIndex = min(max(currentIndex + offset, 0), nodes.count - 1)
+        }
+        else
+        {
+            newIndex = 0
+        }
+
+        self.selection = [nodes[newIndex].id]
+    }
+
     func filteredNodes(forType nodeType:Node.NodeType) -> [NodeClassWrapper]
     {
-        let availableNodes:[NodeClassWrapper] = NodeRegistry.shared.availableNodes
+        let availableNodes:[NodeClassWrapper] = (try? NodeRegistry.shared.availableNodes) ?? []
         let nodesForType:[NodeClassWrapper] = availableNodes.filter( { $0.nodeType == nodeType })
-        return  self.searchString.isEmpty ? nodesForType : nodesForType.filter {  $0.nodeName.localizedCaseInsensitiveContains(self.searchString) }
+        return  self.searchString.isEmpty ? nodesForType : nodesForType.filter {  $0.nodeName.localizedStandardContains(self.searchString) }
     }
 }

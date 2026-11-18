@@ -15,10 +15,12 @@ import Metal
 import MetalFX
 import Satin
 
-final class MetalFXSpatialUpsample2xNode: BaseEffectNode
+final class MetalFXSpatialUpsample2xNode: BaseImageNode
 {
     override class var name: String { "Upsample" }
     override class var nodeType: Node.NodeType { .Image(imageType: .Analysis) } // fits Image Processing bucket :contentReference[oaicite:4]{index=4}
+    override class var defaultImageInputCountHint: Int? { 1 }
+    override class var nodeDescription: String { "Upscales an image 2x using MetalFX spatial upsampling" }
 
     // MetalFX state
     private var spatialScaler: MTLFXSpatialScaler?
@@ -29,18 +31,21 @@ final class MetalFXSpatialUpsample2xNode: BaseEffectNode
     // Output texture cache
 //    private var outputTexture: MTLTexture?
     
-    override func execute(context: GraphExecutionContext,
-                          renderPassDescriptor: MTLRenderPassDescriptor,
-                          commandBuffer: MTLCommandBuffer)
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
-        guard self.inputTexturePort.valueDidChange || isDirty else {
+        guard self.imageInputPorts().first?.valueDidChange == true || isDirty else {
             return
         }
 
-        guard let inTex = self.inputTexturePort.value?.texture else {
+        guard let inImage = self.inputImage(at: 0) else {
             return
         }
 
+        let inTex = inImage.texture
         let inputWidth = inTex.width
         let inputHeight = inTex.height
         let inputFormat  = inTex.pixelFormat
@@ -54,14 +59,18 @@ final class MetalFXSpatialUpsample2xNode: BaseEffectNode
             self.rebuildScalerAndTargets(for: inTex)
         }
 
-        guard let scaler = self.spatialScaler,
-              let outImage = context.graphRenderer?.newImage(withWidth: inTex.width, height: inTex.height)
-        else
+        guard let scaler = self.spatialScaler else
         {
             self.outputTexturePort.send(nil)
             return
         }
 
+        let outImage = try renderer.newImage(
+            withWidth: inputWidth * 2,
+            height: inputHeight * 2,
+            format: inputFormat
+        )
+        outImage.textureTransform = inImage.textureTransform
         // Validate usage (best-effort). MetalFX requires the texture usage be a superset of these.
         // (Some upstream nodes may create textures with too-restrictive usage flags.)
         if !inTex.usage.contains(scaler.colorTextureUsage) {

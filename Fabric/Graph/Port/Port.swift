@@ -25,21 +25,6 @@ public enum PortDirection : String, Codable
 }
 
 
-public struct PortAnchorKey: PreferenceKey
-{
-    public typealias Value = [UUID : Anchor<CGPoint>]
-    
-    public static var defaultValue: [UUID : Anchor<CGPoint>] = [:]
-    
-    public static func reduce(value: inout [UUID : Anchor<CGPoint>],
-                       nextValue: () -> [UUID : Anchor<CGPoint>])
-    {
-        // later writers win
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
-    }
-}
-
-
 struct OutletData : Codable
 {
     let portID: UUID
@@ -96,14 +81,18 @@ extension UTType
         hasher.combine(name)
     }
     
-    public let id:UUID
+    /// Mutable only via hydrate(from:) during decode, which adopts the
+    /// document's saved identity so UUID-keyed connections can rebind.
+    public private(set) var id:UUID
 
     public let name: String
 
     public var portDescription: String = ""
 
     public var published: Bool = false
-    
+
+    public var publishedName: String? = nil
+
     // Kind of lame, but necessary to avoid some type based bullshit.
     // TODO: Figure out a way to hide setting this (seems not good)
     // unless its a ParameterPort? 
@@ -114,12 +103,28 @@ extension UTType
     
     @ObservationIgnored public var valueDidChange:Bool = true
 
-    // BARF?
-    internal func boxedValue() -> PortValue? { nil }
-    internal func setBoxedValue(_ boxed: PortValue?) { }
+    /// Runtime-polymorphic read for ports whose concrete type is only known at
+    /// runtime — routing nodes' boxed forwarding, Iterator's count resolution,
+    /// and layout copying. Pairs with sendBoxed.
+    internal func snapshotValue() -> PortValue? { nil }
+    internal func restoreValue(from boxed: PortValue?) { }
+
+    /// Unboxes `boxed` into the port's native type and propagates to connected inlets via `send`.
+    /// Use this to deliver a PortValue through a port whose concrete type is only known at runtime.
+    internal func sendBoxed(_ boxed: PortValue?) { }
+
+    /// Forced variant for stateful nodes that need to publish a new event even when the boxed value
+    /// compares equal to the previous value.
+    internal func sendBoxed(_ boxed: PortValue?, force: Bool) { sendBoxed(boxed) }
     
-    @ObservationIgnored public weak var node: Node?
-    public var connections: [Port] = []
+    // Unowned, not weak: any weak reference gives Node a Swift side table, which
+    // slows every retain and release of it. Cleared on registry removal and Node deinit.
+    @ObservationIgnored public unowned var node: Node?
+    @ObservationIgnored internal var deferredSendCapture: GraphDeferredSendCapture?
+    @ObservationIgnored internal var deferredOutputIndex = 0
+    @ObservationIgnored internal var onValueChanged: (() -> Void)?
+
+    internal var connections: [Connection] = []
     @ObservationIgnored public let kind: PortKind
     @ObservationIgnored public let direction:PortDirection = .Horizontal
     @ObservationIgnored public var color:Color
@@ -127,7 +132,7 @@ extension UTType
 
     public var debugDescription: String
     {
-        return "\(self.node?.name ?? "No Node!!") - \(String(describing: type(of: self)))  \(id)"
+        return "\(self.node?.debugDescription ?? "No Node!!") - \(String(describing: type(of: self)))  \(id)"
     }
     
     public init(name: String, kind: PortKind, description: String = "", id:UUID)
@@ -144,10 +149,10 @@ extension UTType
     {
         case id
         case name
-        case connections
         case kind
         case direction
         case published
+        case publishedName
         case portDescription
     }
 
@@ -159,6 +164,7 @@ extension UTType
         self.name = try container.decode(String.self, forKey: .name)
         self.kind = try container.decode(PortKind.self, forKey: .kind)
         self.published = try container.decodeIfPresent(Bool.self, forKey: .published) ?? false
+        self.publishedName = try container.decodeIfPresent(String.self, forKey: .publishedName)
         self.portDescription = try container.decodeIfPresent(String.self, forKey: .portDescription) ?? ""
         self.color = .clear
         self.backgroundColor = .clear
@@ -172,31 +178,104 @@ extension UTType
         try container.encode(kind, forKey: .kind)
         try container.encode(published, forKey: .published)
 
-        // Only encode if non-empty to save space
+        if let publishedName
+        {
+            try container.encode(publishedName, forKey: .publishedName)
+        }
+
         if !portDescription.isEmpty
         {
             try container.encode(portDescription, forKey: .portDescription)
         }
 
-        let connectedPortIds = self.connections.map( { $0.id } )
-
-        try container.encode(connectedPortIds, forKey: .connections)
     }
     
     deinit
     {
+        // Connections reference their endpoints unowned. A connection in this
+        // port's list points at this port; clear it before it can dangle.
+        for connection in self.connections
+        {
+            if connection.outletPortID == self.id { connection.outletPortReference = nil }
+            if connection.inletPortID == self.id { connection.inletPortReference = nil }
+        }
         self.connections.removeAll()
 //        print("Deinit Port \(self.id)")
     }
     
+    /// The display name: publishedName if set, otherwise the port's own name.
+    public var displayName: String { publishedName ?? name }
+
+    /// Identity for view code that must re-identify a port view when its type
+    /// changes: `id` alone survives a TypeAgnosticNode Settings-driven type
+    /// swap unchanged (addOrReplaceDynamicPortPreservingIdentity preserves it
+    /// so wires reconnect), so views keyed on `id` alone see no change and
+    /// skip re-rendering the stale type.
+    public var identitySignature: String { "\(id):\(portType.rawValue)" }
+
+    public var connectedPorts: [Port]
+    {
+        connections.compactMap { $0.port(opposite: self) }
+    }
+
+    public var connectedInlets: [Port]
+    {
+        connections.compactMap { connection in
+            guard connection.outletPortID == id else { return nil }
+            return connection.inletPort
+        }
+    }
+
+    public var connectedOutlets: [Port]
+    {
+        connections.compactMap { connection in
+            guard connection.inletPortID == id else { return nil }
+            return connection.outletPort
+        }
+    }
+
+    public func connection(to port: Port) -> Connection?
+    {
+        connections.first { connection in
+            connection.port(opposite: self)?.id == port.id
+        }
+    }
+
+    /// Hover-tooltip string for this port: `displayName: type` plus the
+    /// current value when available.
+    public var inspectionTooltip: String {
+        let head = "\(displayName): \(portType.rawValue)"
+        guard let value = snapshotValue() else { return head }
+
+        return "\(head) - \(portType.previewString(for: value))"
+    }
+
+    /// Applies document-owned state from a decoded snapshot onto this
+    /// code-declared port: identity (connections are keyed by port UUID),
+    /// published state, and — when the types still agree — the persisted value.
+    /// Code-owned metadata (name, description, parameter range and control
+    /// type) deliberately stays as declared; the document does not own it.
+    /// Must run before the port is registered — the registry indexes by id.
+    internal func hydrate(from decoded: Port)
+    {
+        self.id = decoded.id
+        self.published = decoded.published
+        self.publishedName = decoded.publishedName
+
+        if decoded.portType == self.portType,
+           let boxedValue = decoded.snapshotValue()
+        {
+            self.restoreValue(from: boxedValue)
+        }
+    }
+
     public func canConnect(to other:Port) -> Bool
     {
-        self.portType.canConnect(to: other.portType)
+        if self.kind == .Inlet, self.portType == .Virtual { return true }
+        if other.kind == .Inlet, other.portType == .Virtual { return true }
+        return self.portType.canConnect(to: other.portType)
     }
     
-    public func connect(to other: Port) { fatalError("override") }
-    public func disconnect(from other: Port) { fatalError("override") }
-    public func disconnectAll() { fatalError("override") }
     public func teardown() { }
 
 }

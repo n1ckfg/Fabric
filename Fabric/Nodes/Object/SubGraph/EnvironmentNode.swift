@@ -14,6 +14,7 @@ public class EnvironmentNode: SubgraphNode
 {
     override public class var name:String { "Environment Node" }
     override public class var nodeType:Node.NodeType { Node.NodeType.Subgraph }
+    override public class var nodeDescription: String { "Subgraph that provides an environment for 3D rendering" }
     
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -37,25 +38,34 @@ public class EnvironmentNode: SubgraphNode
     {
         super.init(context: context)
         
-        self.subGraph.scene = IBLScene()
+        self.subGraph.scene = IBLScene(context: context)
     }
     
     public required init(from decoder: any Decoder) throws
     {
+        guard let context = decoder.context?.documentContext as? Context else {
+            fatalError("Failed to decode Context from decoder")
+        }
+        
         try super.init(from: decoder)
         
-        self.subGraph.scene = IBLScene()
+        self.subGraph.scene = IBLScene(context: context)
     }
     
-    override public func execute(context: GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
-                                 commandBuffer: any MTLCommandBuffer)
+                                 commandBuffer: MTLCommandBuffer) throws
     {
         if self.inputEnvironmentTexture.valueDidChange,
            let environmentTexture = self.inputEnvironmentTexture.value,
            let iblScene = self.subGraph.scene as? IBLScene
         {
-            iblScene.setEnvironment(texture: environmentTexture.texture, cubemapSize: 2048, reflectionSize:2048, irradianceSize: 32)
+            iblScene.setEnvironment(texture: environmentTexture.texture, cubemapSize: 2048, reflectionSize:2048, irradianceSize: 32) { result in
+                if case let .failure(error) = result {
+                    print("Environment lighting failed: \(error)")
+                }
+            }
         }
         
         if self.inputEnvironmentIntensity.valueDidChange,
@@ -72,6 +82,7 @@ public class EnvironmentNode: SubgraphNode
 //            iblScene.cubemapGenerator?.blur = inputEnvironmentIntensity
 //        }
         
-        super.execute(context: context, renderPassDescriptor: renderPassDescriptor, commandBuffer: commandBuffer)
+        // This calls forward for us...
+        try super.execute(renderer: renderer, executionInfo: executionInfo, renderPassDescriptor: renderPassDescriptor, commandBuffer: commandBuffer)
     }
 }

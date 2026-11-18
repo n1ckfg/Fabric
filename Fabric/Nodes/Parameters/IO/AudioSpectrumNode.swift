@@ -1,0 +1,829 @@
+//
+//  AudioSpectrumNode.swift
+//  Fabric
+//
+//  Created by Anton Marini on 11/4/25.
+//
+
+import Foundation
+import SwiftUI
+import Satin
+import simd
+import AVFoundation
+import Accelerate
+import Dispatch
+import Synchronization
+import os
+
+public class AudioSpectrumNode : Node
+{
+    fileprivate static let log = Logger(subsystem: "graphics.fabric", category: "AudioSpectrumNode")
+
+    final class SimpleFilterBank {
+        // ---- Config ----
+        var sampleRate: Float
+        var bandCount: Int
+        var fMin: Float
+        var fMax: Float
+        var Q: Float = 4.3
+        var dbFloor: Float = -80.0
+
+        // Optional perceptual weighting
+        var useAWeighting: Bool = false
+
+        // ---- Envelope ----
+        private var env = [Float]()
+        var attackMS: Float = 10.0
+        var releaseMS: Float = 10.0
+
+        // ---- Per-band metadata/corrections ----
+        private var gainCorrection  = [Float]()    // ≈ sqrt(Q / fc) to flatten low-end bias
+        private var weightCorrection = [Float]()   // optional A-weighting (linear gain)
+
+        // ---- vDSP biquad state ----
+        // Coefficients are passed to vDSP_biquad_CreateSetup as doubles for precision.
+        // vDSP_biquad uses Direct Form I; the Delay array holds [x[n-2], x[n-1], y[n-2], y[n-1]]
+        // per band and is updated automatically by vDSP_biquad on each call.
+        private var biquadSetups = [OpaquePointer?]()
+        private var delays = [Float]()              // flat: bandCount × 4 elements
+
+        // ---- Scratch buffers ----
+        private var work        = [Float]()         // n samples: per-band filtered output
+        private var rmsValues   = [Float]()         // bandCount
+        private var correctedBuf = [Float]()        // bandCount
+        private var dbBuf       = [Float]()         // bandCount
+        private var normBuf     = [Float]()         // bandCount
+
+        init(sampleRate: Float,
+             bandCount: Int,
+             fMin: Float = 50.0,
+             fMax: Float = 12000.0,
+             Q: Float = 4.3,
+             dbFloor: Float = -80.0)
+        {
+            self.sampleRate = sampleRate
+            self.bandCount  = max(1, bandCount)
+            self.fMin = fMin
+            self.fMax = fMax
+            self.Q = Q
+            self.dbFloor = dbFloor
+            buildBands()
+            env = .init(repeating: 0, count: self.bandCount)
+        }
+
+        deinit {
+            for setup in biquadSetups { vDSP_biquad_DestroySetup(setup) }
+        }
+
+        // Call when bandCount / fMin / fMax / Q / sampleRate change.
+        func buildBands() {
+            // Tear down previous setups; the new filter starts from silence (delays = 0).
+            for setup in biquadSetups { vDSP_biquad_DestroySetup(setup) }
+            biquadSetups.removeAll(keepingCapacity: true)
+
+            delays       = .init(repeating: 0, count: bandCount * 4)
+            rmsValues    = .init(repeating: 0, count: bandCount)
+            correctedBuf = .init(repeating: 0, count: bandCount)
+            dbBuf        = .init(repeating: 0, count: bandCount)
+            normBuf      = .init(repeating: 0, count: bandCount)
+
+            gainCorrection   = .init(repeating: 1, count: bandCount)
+            weightCorrection = .init(repeating: 1, count: bandCount)
+
+            let r = fMax / fMin
+            for k in 0..<bandCount {
+                let t   = bandCount > 1 ? Float(k) / Float(bandCount - 1) : 0
+                let fck = fMin * powf(r, t)
+
+                let w0    = 2.0 * Float.pi * (fck / sampleRate)
+                let cosw0 = cosf(w0)
+                let sinw0 = sinf(w0)
+                let alpha = sinw0 / (2.0 * Q)
+
+                // RBJ band-pass (constant skirt gain), normalized by a0 = 1 + alpha
+                let a0k  =  1.0 + alpha
+                let b0k  =  alpha  / a0k
+                let b1k  =  0.0   as Float
+                let b2k  = -alpha  / a0k
+                let a1k  = (-2.0 * cosw0) / a0k
+                let a2k  = ( 1.0 - alpha) / a0k
+
+                // vDSP_biquad_CreateSetup takes double coefficients for precision.
+                var coeffs: [Double] = [Double(b0k), Double(b1k), Double(b2k),
+                                        Double(a1k), Double(a2k)]
+                biquadSetups.append(vDSP_biquad_CreateSetup(&coeffs, 1))
+
+                // Bandwidth/energy tilt correction ~ sqrt(Q / fc)
+                gainCorrection[k] = sqrtf(max(Q / max(fck, 1e-12), 0))
+
+                if useAWeighting {
+                    weightCorrection[k] = aWeightingLinear(fck)
+                }
+            }
+        }
+
+        // Rough A-weighting (linear gain). Inputs in Hz.
+        private func aWeightingLinear(_ f: Float) -> Float {
+            let f2 = max(f, 1e-3) * max(f, 1e-3)
+            let f4 = f2 * f2
+            let f12200:   Float = 12200.0
+            let f12200_2: Float = f12200 * f12200
+            let num = f4 * f12200_2
+            // IEC 61672-1 / ISO 226
+            let den = (f2 + 20.6*20.6) * sqrtf((f2 + 107.7*107.7) * (f2 + 737.9*737.9)) * (f2 + f12200_2)
+            let a_dB = 20.0 * log10f(max(num / max(den, 1e-12), 1e-12)) + 2.0
+            return powf(10.0, a_dB / 20.0)
+        }
+
+        // Returns [0,1] per band. Caller owns the UnsafeBufferPointer lifetime.
+        func processAudioData(_ samples: UnsafeBufferPointer<Float>) -> ContiguousArray<Float> {
+            let n = samples.count
+            if work.count < n { work = .init(repeating: 0, count: n) }
+
+            // Block-based envelope coefficients
+            let hop = Float(n) / sampleRate
+            let a   = 1 - expf(-hop / max(attackMS  * 0.001, 1e-6))
+            let r   = 1 - expf(-hop / max(releaseMS * 0.001, 1e-6))
+
+            // Pass 1: vDSP_biquad per band + RMS into rmsValues[]
+            //
+            // vDSP_biquad processes all N samples with SIMD, replacing the previous
+            // scalar for-i loop. The Delay array [x[n-2], x[n-1], y[n-2], y[n-1]]
+            // is updated in-place by vDSP_biquad and carries state across calls.
+            work.withUnsafeMutableBufferPointer { workBuf in
+                delays.withUnsafeMutableBufferPointer { delayBuf in
+                    for k in 0..<bandCount {
+                        guard let setup = biquadSetups[k] else { rmsValues[k] = 0; continue }
+                        vDSP_biquad(setup,
+                                    delayBuf.baseAddress!.advanced(by: k * 4),
+                                    samples.baseAddress!, 1,
+                                    workBuf.baseAddress!, 1,
+                                    vDSP_Length(n))
+                        vDSP_rmsqv(workBuf.baseAddress!, 1, &rmsValues[k], vDSP_Length(n))
+                    }
+                }
+            }
+
+            // Pass 2: vectorized corrections + dB normalization
+            // Apply gain correction (bandwidth/energy tilt)
+            vDSP_vmul(rmsValues, 1, gainCorrection, 1, &correctedBuf, 1, vDSP_Length(bandCount))
+            if useAWeighting {
+                vDSP_vmul(correctedBuf, 1, weightCorrection, 1, &correctedBuf, 1, vDSP_Length(bandCount))
+            }
+            // Floor before log to avoid log(0)
+            var logFloor: Float = 1e-12
+            var logCeil:  Float = .greatestFiniteMagnitude
+            vDSP_vclip(correctedBuf, 1, &logFloor, &logCeil, &correctedBuf, 1, vDSP_Length(bandCount))
+            // Vectorized log10, then × 20 → dB
+            var n32 = Int32(bandCount)
+            vvlog10f(&dbBuf, correctedBuf, &n32)
+            var twenty: Float = 20.0
+            vDSP_vsmul(dbBuf, 1, &twenty, &dbBuf, 1, vDSP_Length(bandCount))
+            // Clamp to dbFloor
+            vDSP_vthr(dbBuf, 1, &dbFloor, &dbBuf, 1, vDSP_Length(bandCount))
+            // Normalize: (db - dbFloor) / (0 - dbFloor) = db * (1/(-dbFloor)) + 1
+            var invNegDbFloor: Float = 1.0 / (-dbFloor)
+            var one: Float = 1.0
+            vDSP_vsmsa(dbBuf, 1, &invNegDbFloor, &one, &normBuf, 1, vDSP_Length(bandCount))
+            // Clamp to [0, 1]
+            var zero: Float = 0.0
+            var oneClamp: Float = 1.0
+            vDSP_vclip(normBuf, 1, &zero, &oneClamp, &normBuf, 1, vDSP_Length(bandCount))
+
+            // Pass 3: envelope (sequential — each band depends only on its own prior state)
+            var out = ContiguousArray<Float>(repeating: 0, count: bandCount)
+            for k in 0..<bandCount {
+                let norm  = normBuf[k]
+                let ePrev = env[k].isFinite ? env[k] : 0
+                var e = norm > ePrev ? ePrev + a * (norm - ePrev)
+                                     : ePrev + r * (norm - ePrev)
+                if !e.isFinite { e = 0 }
+                env[k] = e
+                out[k] = e
+            }
+            return out
+        }
+    }
+
+    // Lock-free triple buffer for capture-queue → execute-queue handoff.
+    // Three pre-allocated buffers rotate among three owners (producer, consumer,
+    // spare) using a single Atomic<Int>. The producer never touches the buffer
+    // the consumer is currently reading, and vice versa — no lock required on
+    // either thread.
+    private final class TripleBuffer: @unchecked Sendable {
+        private let capacity: Int
+        private var buffers: [ContiguousArray<Float>]
+        // Exact frame count written per buffer. Written before the releasing
+        // exchange, read after the acquiring exchange — happens-before covers it.
+        private var sampleCounts: [Int]
+        // bits [1:0] = spare buffer index (0, 1, or 2), bit [2] = new-data flag
+        private let state: Atomic<Int>
+        // Float.bitPattern; 0 means sample rate not yet known
+        private let sampleRateBits: Atomic<UInt32>
+        // Thread-private — each index is only touched by one side
+        private var producerIndex: Int = 0   // capture queue only
+        private var consumerIndex: Int = 1   // execute thread only
+
+        init(capacity: Int) {
+            self.capacity       = capacity
+            self.buffers        = (0..<3).map { _ in ContiguousArray(repeating: Float(0), count: capacity) }
+            self.sampleCounts   = [0, 0, 0]
+            self.state          = Atomic<Int>(2)   // spare = buffer[2], no new data
+            self.sampleRateBits = Atomic<UInt32>(0)
+        }
+
+        // Capture-queue only — no allocation, no lock.
+        func write(floats: UnsafePointer<Float>, stride: Int, frameCount: Int, sampleRate: Float) {
+            let n = min(frameCount, capacity)
+            for i in 0..<n {
+                let s = floats[i * stride]
+                buffers[producerIndex][i] = s.isFinite ? s : 0
+            }
+            sampleCounts[producerIndex] = n
+            if sampleRate.isFinite, sampleRate > 0 {
+                sampleRateBits.store(sampleRate.bitPattern, ordering: .releasing)
+            }
+            let old = state.exchange(producerIndex | 0x4, ordering: .releasing)
+            producerIndex = old & 0x3
+        }
+
+        // Execute thread only — calls body only when new data is available.
+        func withLatestBuffer(_ body: (UnsafeBufferPointer<Float>, Int, Float?) -> Void) {
+            let old = state.exchange(consumerIndex, ordering: .acquiring)
+            guard (old & 0x4) != 0 else { return }
+            consumerIndex = old & 0x3
+            let count = sampleCounts[consumerIndex]
+            guard count > 0 else { return }
+            let bits = sampleRateBits.load(ordering: .relaxed)
+            let rate: Float? = bits == 0 ? nil : Float(bitPattern: bits)
+            buffers[consumerIndex].withUnsafeBufferPointer { ptr in
+                body(UnsafeBufferPointer(start: ptr.baseAddress!, count: count), count, rate)
+            }
+        }
+
+        // Clears the new-data flag so stale data from the previous device
+        // isn't consumed after a session switch.
+        func invalidate() {
+            let cur = state.load(ordering: .relaxed)
+            state.store(cur & 0x3, ordering: .relaxed)
+            sampleRateBits.store(0, ordering: .relaxed)
+        }
+    }
+
+    override public class var name:String { "Audio Spectrum" }
+    override public class var nodeType:Node.NodeType { .Parameter(parameterType: .IO) }
+    override public class var nodeExecutionMode: Node.ExecutionMode { .Provider }
+    override public class var nodeTimeMode: Node.TimeMode { .Idle }
+    override public class var nodeDescription: String { "Captures audio from the selected input device and emits a normalized per-band spectrum. Sensitivity controls how responsive the analyzer is to quiet sounds — 0 analyses only louder audio, 1 is full sensitivity. Gain multiplies the bar values after normalization, clamped to [0, 1] — a visual 'overdrive' that pushes bars toward full-scale without touching the underlying signal." }
+
+    // Ports
+    override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
+        let ports = super.registerPorts(context: context)
+
+        return ports +
+        [
+            ("inputAudioDevice", ParameterPort(parameter: StringParameter("Device Name", AudioSpectrumNode.defaultDeviceName, .dropdown, "Audio input device to capture from, or Default for the system's default input"))),
+            ("inputBands", ParameterPort(parameter: IntParameter("Bands", 8, 1, 256, .inputfield, "Number of frequency bands in the spectrum output"))),
+            ("inputSensitivity", ParameterPort(parameter: FloatParameter("Sensitivity", 0.5, 0.0, 1.0, .slider, "How sensitive the analyzer is to quiet sounds. 0 = analyses only louder sounds (quiet audio is ignored). 1 = full sensitivity (picks up even very faint audio). Turn up to make the display react to subtle input; turn down if you only care about peaks."))),
+            ("inputGain", ParameterPort(parameter: FloatParameter("Gain", 1.0, 0.0, 10.0, .slider, "Multiplier applied to the output band values after normalization, clamped to [0, 1]. 1 = pass-through; values > 1 push bars toward full-scale ('visual overdrive' — the bars saturate earlier); values < 1 scale bars down. Purely affects the output, not the underlying audio analysis."))),
+            ("inputSmoothing", ParameterPort(parameter: FloatParameter("Smoothing", 0.0, 0.0, 1.0, .slider, "Smoothing factor for frequency band transitions"))),
+            ("inputAttack", ParameterPort(parameter: FloatParameter("Attack", 0.0, 0.0, 100.0, .slider, "Attack time in milliseconds for rising levels"))),
+            ("inputRelease", ParameterPort(parameter: FloatParameter("Release", 0.0, 0.0, 100.0, .slider, "Release time in milliseconds for falling levels"))),
+            ("outputSpectrum", NodePort<ContiguousArray<Float>>(name: "Spectrum", kind: .Outlet, description: "Array of frequency band values from 0 to 1")),
+        ]
+    }
+
+    public var inputAudioDevice:ParameterPort<String> { port(named: "inputAudioDevice") }
+
+    /// The dropdown entry for the system's default input. An empty name, as
+    /// documents saved before it have, means the same.
+    fileprivate static let defaultDeviceName = "Default"
+    public var inputBands:ParameterPort<Int> { port(named: "inputBands") }
+    public var inputSensitivity:ParameterPort<Float> { port(named: "inputSensitivity") }
+    public var inputGain:ParameterPort<Float> { port(named: "inputGain") }
+    public var inputSmoothing:ParameterPort<Float> { port(named: "inputSmoothing") }
+    public var inputAttack:ParameterPort<Float> { port(named: "inputAttack") }
+    public var inputRelease:ParameterPort<Float> { port(named: "inputRelease") }
+    public var outputSpectrum:NodePort<ContiguousArray<Float>> { port(named: "outputSpectrum") }
+
+    // Delegate receives CMSampleBuffers on the capture queue and forwards
+    // them into the owner's tripleBuffer. Weak reference breaks the
+    // otherwise self-retaining delegate/owner cycle.
+    private final class CaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate
+    {
+        weak var owner: AudioSpectrumNode?
+
+        func captureOutput(_ output: AVCaptureOutput,
+                           didOutput sampleBuffer: CMSampleBuffer,
+                           from connection: AVCaptureConnection)
+        {
+            self.owner?.processAudioSampleBuffer(sampleBuffer)
+        }
+    }
+
+    // AVCaptureSession replaces AVAudioEngine: its per-session input device
+    // selection via AVCaptureDeviceInput is the supported macOS API for
+    // per-node device switching, where AVAudioEngine's AUHAL-routing is not.
+    private var captureSession = AVCaptureSession()
+    private let captureQueue   = DispatchQueue(label: "fabric.AudioSpectrumNode.capture_queue")
+    private var captureDelegate = CaptureDelegate()
+
+    private let tripleBuffer = TripleBuffer(capacity: 4096)
+
+    // Device enumeration. AVCaptureDevice.DiscoverySession gives us the raw
+    // AVCaptureDevice instances which feed straight into AVCaptureDeviceInput
+    // — no UID→AudioDeviceID translation needed.
+    //
+    // Made at the first enable, not at init: discovering devices is a call into
+    // CoreMediaIO that can block for a second, and a node is made far more
+    // often than it runs (the node browser, opening a document, every-node
+    // sweeps). Written before the device observers exist, so they only read it.
+    private var discoverySession: AVCaptureDevice.DiscoverySession? = nil
+
+    /// Available audio devices, populated from `AVCaptureDevice`
+    /// connect/disconnect notifications.
+    ///
+    /// The observer is registered with `queue: .main` because the
+    /// handler updates the dropdown's `StringParameter.options`, and
+    /// Fabric's `@Observable` engine types (Node, Parameter, …) are
+    /// main-thread-affine: Observation's change tracking misbehaves on
+    /// non-main mutations. That's a property of Fabric's current
+    /// parameter design — engine state and UI binding state share a
+    /// single object — not a SwiftUI requirement of this node.
+    ///
+    /// `tripleBuffer` is written from the capture queue and read from the
+    /// execute thread lock-free — no `.main` constraint applies there.
+    private struct DeviceList: ~Copyable, @unchecked Sendable {
+        var devices: [AVCaptureDevice] = []
+    }
+    private let devicesLock = Mutex<DeviceList>(DeviceList())
+    /// The device the session captures from: set where execute builds it, on the
+    /// render thread, and read when a device disconnects, on main.
+    private let capturingDeviceID = Mutex<String?>(nil)
+    private var wasConnectedObserver: Any?
+    private var wasDisconnectedObserver: Any?
+
+    public required init(context: Context)
+    {
+        super.init(context: context)
+        self.captureDelegate.owner = self
+    }
+
+    public required init(from decoder: any Decoder) throws
+    {
+        try super.init(from: decoder)
+        self.captureDelegate.owner = self
+    }
+
+    override public func enableExecution(renderer:GraphRenderer) throws
+    {
+        if self.discoverySession == nil
+        {
+            self.discoverySession = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external],
+                                                                     mediaType: .audio,
+                                                                     position: .unspecified)
+        }
+
+        self.wasConnectedObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.refreshAudioDeviceOptions()
+
+            // A device arriving may be what a failed capture was waiting for.
+            if self.captureStatus != nil,
+               AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            {
+                self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            }
+        }
+        self.wasDisconnectedObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            self.refreshAudioDeviceOptions()
+
+            // The device capturing has gone: rebuild, falling back to the default
+            // input. Only started nodes execute the rebuild.
+            if let device = notification.object as? AVCaptureDevice,
+               device.uniqueID == self.capturingDeviceID.withLock({ $0 })
+            {
+                self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            }
+        }
+
+        self.refreshAudioDeviceOptions()
+        try super.enableExecution(renderer: renderer)
+    }
+
+    override public func disableExecution(renderer:GraphRenderer) throws
+    {
+        if let observer = self.wasConnectedObserver    { NotificationCenter.default.removeObserver(observer) }
+        if let observer = self.wasDisconnectedObserver { NotificationCenter.default.removeObserver(observer) }
+        self.wasConnectedObserver = nil
+        self.wasDisconnectedObserver = nil
+
+        // Stop has already stopped it; this lets its device input and output go.
+        self.captureSession = AVCaptureSession()
+        try super.disableExecution(renderer: renderer)
+    }
+
+    private func refreshAudioDeviceOptions()
+    {
+        let fresh = self.discoverySession?.devices ?? []
+        self.devicesLock.withLock { $0.devices = fresh }
+
+        // Enable can run on the render thread; options are main-thread state (see DeviceList).
+        let names = [Self.defaultDeviceName] + fresh.map(\.localizedName)
+        performOnMainAsync {
+            (self.inputAudioDevice.parameter as? StringParameter)?.options = names
+        }
+    }
+
+    /// The selected device, or the default input when Default is selected or the
+    /// selected device is not connected; the name of a device not connected comes too.
+    private func resolveSelectedAudioDevice() -> (device: AVCaptureDevice?, missingDeviceName: String?)
+    {
+        guard let name = self.inputAudioDevice.value, !name.isEmpty, name != Self.defaultDeviceName else
+        {
+            return (AVCaptureDevice.default(for: .audio), nil)
+        }
+
+        let knownDevices = self.devicesLock.withLock { $0.devices }
+        if let match = knownDevices.first(where: { $0.localizedName == name })
+        {
+            return (match, nil)
+        }
+        return (AVCaptureDevice.default(for: .audio), name)
+    }
+
+    // Capture runs only while started. The session is built in execute, so a
+    // start and a device change in the same frame build it once. Set from the
+    // permission callback too; a set that lands after a stop does nothing, as
+    // only started nodes execute and start sets it afresh.
+    private let captureSessionNeedsSetup = Atomic<Bool>(false)
+
+    // Without microphone access the node still starts, and outputs nothing.
+    override public func startExecution(renderer:GraphRenderer) throws {
+        performOnMainAsync { self.isRunning = true }
+        self.requestCapture()
+        try super.startExecution(renderer: renderer)
+    }
+
+    /// Asks execute to build the session, once microphone access allows it.
+    private func requestCapture()
+    {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:
+                self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            case .notDetermined:
+                AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                    guard granted else
+                    {
+                        self?.reportCaptureStatus(Self.microphoneAccessStatus)
+                        return
+                    }
+                    self?.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+                }
+            default:
+                self.reportCaptureStatus(Self.microphoneAccessStatus)
+        }
+    }
+
+    private static let microphoneAccessStatus = NodeStatus.error("Microphone access is not allowed. Allow it in System Settings › Privacy & Security › Microphone, then Retry.")
+
+    // MARK: - Capture Status
+
+    // The status is main-thread state, read by the title and settings views.
+    // Start, stop and execute can run on the render thread, and the permission
+    // callback on any thread, so each hands over to main with performOnMainAsync,
+    // which keeps them in order.
+    private var isRunning = false
+
+    /// Main-thread state, set while the node is started but not capturing. Each
+    /// failure is worded once, where it happens, so the glyph, the settings view
+    /// and the log agree.
+    private var captureStatus: NodeStatus?
+    {
+        didSet
+        {
+            guard captureStatus != oldValue else { return }
+            performOnMainSync
+            {
+                _settingsModel.captureStatus = captureStatus
+                // Retry is for failures; a warning says what the node is doing instead.
+                _settingsModel.canRetry = if case .error = captureStatus { true } else { false }
+            }
+            self.subtitleSubject.send()
+        }
+    }
+
+    override public func deriveStatuses() -> [NodeStatus] { captureStatus.map { [$0] } ?? [] }
+
+    private func reportCaptureStatus(_ status: NodeStatus?)
+    {
+        if let status
+        {
+            Self.log.error("\(status.message, privacy: .public)")
+        }
+        performOnMainAsync {
+            // A failure reported after a stop is no longer the node's state.
+            guard self.isRunning else { return }
+            self.captureStatus = status
+        }
+    }
+
+    fileprivate func retryCapture()
+    {
+        self.requestCapture()
+    }
+
+    override public func stopExecution(renderer:GraphRenderer) throws
+    {
+        performOnMainAsync {
+            self.isRunning = false
+            self.captureStatus = nil
+        }
+        self.captureSessionNeedsSetup.store(false, ordering: .relaxed)
+        if self.captureSession.isRunning
+        {
+            self.captureSession.stopRunning()
+        }
+        try super.stopExecution(renderer: renderer)
+    }
+
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
+    {
+        if self.inputAudioDevice.valueDidChange
+        {
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            {
+                self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            }
+            pendingRebuild = true
+        }
+
+        // Built only with microphone access; without it, the status already says why.
+        if self.captureSessionNeedsSetup.exchange(false, ordering: .relaxed),
+           AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        {
+            self.setupCaptureSession()
+        }
+
+        // Collect parameter changes; mark rebuild for structural params.
+        // Attack/release are cheap live updates — no rebuild needed.
+        if filterBank == nil { pendingRebuild = true }
+        if self.inputSmoothing.valueDidChange, let v = self.inputSmoothing.value { smoothing = v; pendingRebuild = true }
+        if self.inputBands.valueDidChange,    let v = self.inputBands.value    { bands = v;    pendingRebuild = true }
+        if self.inputAttack.valueDidChange,   let v = self.inputAttack.value   { filterBank?.attackMS  = v }
+        if self.inputRelease.valueDidChange,  let v = self.inputRelease.value  { filterBank?.releaseMS = v }
+
+        var processedOutput: ContiguousArray<Float>? = nil
+        tripleBuffer.withLatestBuffer { ptr, count, rate in
+            let activeRate = rate ?? self.filterBank?.sampleRate ?? 48000
+            if self.pendingRebuild || (rate != nil && rate != self.filterBank?.sampleRate) {
+                self.createFilterBank(sampleRate: activeRate, bandCount: self.bands, normalizedSmoothing: self.smoothing)
+                self.pendingRebuild = false
+            }
+            guard let fb = self.filterBank else { return }
+//            let framesPerTick = Int(round(fb.sampleRate / 200))
+//            let batchCount = min(framesPerTick, count)
+            let analysisWindowMS: Float = 50.0
+            let framesPerWindow = Int(round(fb.sampleRate * analysisWindowMS / 1000.0))
+            let batchCount = min(framesPerWindow, count)
+            let sensitivity = max(0, min(1, self.inputSensitivity.value ?? 0.5))
+            fb.dbFloor = -30 - sensitivity * 90
+            processedOutput = fb.processAudioData(UnsafeBufferPointer(start: ptr.baseAddress!, count: batchCount))
+        }
+        guard var output = processedOutput else { return }
+
+        // Apply gain + clamp in-place with vDSP — no extra allocation.
+        var gain = self.inputGain.value ?? 1.0
+        var zero: Float = 0, one: Float = 1
+        output.withUnsafeMutableBufferPointer { buf in
+            vDSP_vsmul(buf.baseAddress!, 1, &gain, buf.baseAddress!, 1, vDSP_Length(buf.count))
+            vDSP_vclip(buf.baseAddress!, 1, &zero, &one, buf.baseAddress!, 1, vDSP_Length(buf.count))
+        }
+
+        self.outputSpectrum.send(output)
+
+        if self.showSettings
+        {
+            self.visualizationBandValues = Array(output)
+        }
+    }
+
+    var filterBank: SimpleFilterBank? = nil
+
+    let maxSamples = 4096
+
+    private var bands:    Int   = 8
+    private var smoothing: Float = 0.0
+    // Persistent flag so a rebuild request is never lost when withLatestBuffer
+    // returns early (no new audio data) on the same frame as a parameter change.
+    private var pendingRebuild: Bool = true
+
+    func createFilterBank(sampleRate: Float, bandCount: Int, normalizedSmoothing: Float)
+    {
+        // Guard sampleRate (CoreAudio-sourced, not from a port) and the Q
+        // derived from remap — a zero Q produces NaN biquad coefficients.
+        let safeRate: Float = (sampleRate.isFinite && sampleRate > 0) ? sampleRate : 48000
+        let safeBands = max(1, bandCount)
+
+        // Map smoothing to a fixed Q range independent of band count.
+        // smoothing=0 → Q=12 (narrow bands, precise); smoothing=1 → Q=1 (wide bands, smooth).
+        // Using a fixed range avoids the spectrum shape changing when band count changes.
+        let q = remap(normalizedSmoothing, 1.0, 0.0, 1.0, 12.0)
+        let safeQ: Float = (q.isFinite && q > 0) ? q : 4.3
+
+        self.filterBank = SimpleFilterBank(sampleRate: safeRate,
+                                           bandCount: safeBands,
+                                           fMin: 20.0,
+                                           fMax: 15_000.0,
+                                           Q: safeQ,
+                                           dbFloor: -120.0)
+
+        self.filterBank?.attackMS  = self.inputAttack.value  ?? 10.0
+        self.filterBank?.releaseMS = self.inputRelease.value ?? 10.0
+    }
+
+    /// Called on the capture queue for every audio sample buffer. Appends
+    /// Float32 samples directly into `captureState` — no intermediate copy.
+    fileprivate func processAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer)
+    {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return }
+
+        let asbd = asbdPtr.pointee
+        let sampleRate    = Float(asbd.mSampleRate)
+        let channels      = max(1, Int(asbd.mChannelsPerFrame))
+        let isFloat       = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let isInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+        let bitsPerChannel = Int(asbd.mBitsPerChannel)
+
+        // AVCaptureAudioDataOutput on macOS delivers Float32 LPCM by default.
+        // Skip anything else — better silent drop than garbage into the filter bank.
+        guard isFloat, bitsPerChannel == 32 else { return }
+
+        var blockBuffer: CMBlockBuffer?
+        var abl = AudioBufferList()
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: &abl,
+            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr else { return }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(&abl)
+        guard let firstBuffer = buffers.first, let dataPtr = firstBuffer.mData else { return }
+
+        let stride     = isInterleaved ? channels : 1
+        let frameCount = Int(firstBuffer.mDataByteSize) / (stride * MemoryLayout<Float>.size)
+        let floats     = dataPtr.assumingMemoryBound(to: Float.self)
+
+        tripleBuffer.write(floats: floats, stride: stride, frameCount: frameCount, sampleRate: sampleRate)
+    }
+
+    /// Build (or rebuild) the capture session for the currently-selected device.
+    ///
+    /// Recreates AVCaptureSession itself on each call rather than reconfiguring
+    /// in-place. Some virtual devices (e.g. Rogue Amoeba Loopback) deliver
+    /// streams whose format the existing session's CMIO converter can't
+    /// re-negotiate mid-session (`AudioConverterSetProperty(dbca) = pcm!`).
+    /// A fresh session forces a fresh converter.
+    private func setupCaptureSession()
+    {
+        let (selectedDevice, missingDeviceName) = self.resolveSelectedAudioDevice()
+        guard let device = selectedDevice else
+        {
+            self.reportCaptureStatus(.error("No audio input device is available."))
+            return
+        }
+
+        if self.captureSession.isRunning { self.captureSession.stopRunning() }
+
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+
+        do
+        {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else
+            {
+                self.reportCaptureStatus(.error("Cannot capture from \(device.localizedName)."))
+                session.commitConfiguration()
+                return
+            }
+            session.addInput(input)
+
+            let output = AVCaptureAudioDataOutput()
+            // Pin the output format so CMIO has an unambiguous target.
+            // Matches what processAudioSampleBuffer() extracts.
+            output.audioSettings = [
+                AVFormatIDKey:               kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey:      32,
+                AVLinearPCMIsFloatKey:       true,
+                AVLinearPCMIsBigEndianKey:   false,
+                AVLinearPCMIsNonInterleaved: false,
+                AVSampleRateKey:             48_000.0,
+                AVNumberOfChannelsKey:       1
+            ]
+            output.setSampleBufferDelegate(self.captureDelegate, queue: self.captureQueue)
+            guard session.canAddOutput(output) else
+            {
+                self.reportCaptureStatus(.error("Cannot capture audio from \(device.localizedName)."))
+                session.commitConfiguration()
+                return
+            }
+            session.addOutput(output)
+        }
+        catch
+        {
+            self.reportCaptureStatus(.error("Cannot capture from \(device.localizedName): \(error.localizedDescription)"))
+            session.commitConfiguration()
+            return
+        }
+
+        session.commitConfiguration()
+
+        self.captureSession = session
+        self.captureSession.startRunning()
+        self.capturingDeviceID.withLock { $0 = device.uniqueID }
+        // Capture goes on from the default input, and returns to the selected device when it connects.
+        self.reportCaptureStatus(missingDeviceName.map { .warning("\($0) is not connected; capturing from \(device.localizedName).") })
+
+        tripleBuffer.invalidate()
+    }
+
+    // MARK: - Visualization
+
+    // Consumed by the settings popover; populated in execute() only while
+    // showSettings is true.
+    public var visualizationBandValues: [Float] = []
+
+    override public func providesSettingsView() -> Bool { true }
+
+    @MainActor
+    @Observable final class SettingsModel {
+        @ObservationIgnored weak var node: AudioSpectrumNode?
+        var bandValues: [Float] { node?.visualizationBandValues ?? [] }
+        /// Why the node is not capturing although it is started, or nil.
+        var captureStatus: NodeStatus?
+        var canRetry = false
+        init(node: AudioSpectrumNode) { self.node = node }
+        func retryCapture() { node?.retryCapture() }
+    }
+
+    private lazy var _settingsModel = self.performOnMainSync { SettingsModel(node: self) }
+
+    override public func settingsView() -> AnyView
+    {
+        performOnMainSync { AnyView(AudioSpectrumNodeSettingsView(model: _settingsModel)) }
+    }
+
+    override public var settingsSize: SettingsViewSize { .Custom(size: CGSize(width: 460, height: 180)) }
+}
+
+// MARK: - Settings View
+
+private struct AudioSpectrumNodeSettingsView: View
+{
+    let model: AudioSpectrumNode.SettingsModel
+
+    var body: some View
+    {
+        VStack(alignment: .leading)
+        {
+            if let captureStatus = model.captureStatus
+            {
+                HStack
+                {
+                    NodeStatusMessageView(status: captureStatus)
+
+                    Spacer()
+
+                    if model.canRetry
+                    {
+                        Button("Retry")
+                        {
+                            model.retryCapture()
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+
+            BandsVisualizer(bands: { model.bandValues })
+        }
+    }
+}

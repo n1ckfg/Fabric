@@ -1,0 +1,188 @@
+//
+//  JavaScriptNodeSettingsView.swift
+//  Fabric
+//
+//  Created by Codex on 3/13/26.
+//
+
+import SwiftUI
+import CodeEditorView
+import LanguageSupport
+
+@MainActor
+@Observable final class JavaScriptNodeEditorModel
+{
+    var content: String
+    var selectedTimeMode: Node.TimeMode
+    var messages: Set<TextLocated<Message>> = []
+    let languageService: JavaScriptLanguageService
+
+    private weak var node: JavaScriptNode?
+    private var saveTimer: Timer?
+    /// What the node held at the last flush: the editor writes only what was edited since.
+    private var savedContent: String
+    private var savedTimeMode: Node.TimeMode
+
+    init(node: JavaScriptNode)
+    {
+        self.node = node
+        self.content = node.scriptSource
+        self.selectedTimeMode = node.selectedTimeMode
+        self.savedContent = node.scriptSource
+        self.savedTimeMode = node.selectedTimeMode
+        self.languageService = JavaScriptLanguageService()
+        self.refreshMessages()
+    }
+
+    var diagnostics: [JavaScriptNodeDiagnostic]
+    {
+        node?.currentDiagnostics ?? []
+    }
+
+    /// Read off the node, which reads it off the ports the script declares.
+    var executionMode: Node.ExecutionMode
+    {
+        node?.nodeExecutionMode ?? .Processor
+    }
+
+    func scheduleSave()
+    {
+        self.saveTimer?.invalidate()
+        self.saveTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.flush()
+            }
+        }
+    }
+
+    /// Writes what was edited since the last flush and nothing else, so an
+    /// editor closed unedited keeps settings applied to the node meanwhile.
+    func flush()
+    {
+        guard let node else { return }
+        if self.content != self.savedContent || self.selectedTimeMode != self.savedTimeMode
+        {
+            node.setSettings(JavaScriptSettings(scriptSource: self.content, selectedTimeMode: self.selectedTimeMode))
+        }
+        self.savedContent = node.scriptSource
+        self.savedTimeMode = node.selectedTimeMode
+        if node.selectedTimeMode != self.selectedTimeMode
+        {
+            self.selectedTimeMode = node.selectedTimeMode
+        }
+
+        // A script written in the annotated form is kept as the TypeScript it
+        // was read as. Taking that back is what puts the rewrite in front of the
+        // author; without it the editor still holds the annotated text and the
+        // next keystroke saves it over the node's canonical form again.
+        if node.scriptSource != self.content
+        {
+            self.content = node.scriptSource
+        }
+
+        self.refreshMessages()
+    }
+
+    /// Takes the node's source and time mode where they changed under the
+    /// editor, as a value applied to the node; an edit not yet flushed goes.
+    func refreshFromNode()
+    {
+        guard let node else { return }
+        if node.scriptSource != self.savedContent
+        {
+            self.savedContent = node.scriptSource
+            self.content = node.scriptSource
+        }
+        if node.selectedTimeMode != self.savedTimeMode
+        {
+            self.savedTimeMode = node.selectedTimeMode
+            self.selectedTimeMode = node.selectedTimeMode
+        }
+        self.refreshMessages()
+    }
+
+    func refreshMessages()
+    {
+        self.messages = Set(self.diagnostics.map { diagnostic in
+            let category: Message.Category = diagnostic.severity == .warning ? .warning : .error
+            let message = Message(category: category,
+                                  length: max(1, diagnostic.summary.count),
+                                  summary: diagnostic.summary,
+                                  description: AttributedString(diagnostic.detail.isEmpty ? diagnostic.summary : diagnostic.detail))
+            let location = TextLocation(zeroBasedLine: max(0, diagnostic.line), column: max(0, diagnostic.column))
+            return TextLocated(location: location, entity: message)
+        })
+    }
+}
+
+struct JavaScriptNodeSettingsView: View
+{
+    @Bindable var editorModel: JavaScriptNodeEditorModel
+    @State private var position: CodeEditor.Position = .init()
+
+    init(editorModel: JavaScriptNodeEditorModel)
+    {
+        self.editorModel = editorModel
+    }
+
+    var body: some View
+    {
+        VStack(alignment: .leading, spacing: 12)
+        {
+            CodeEditorGuidance(
+                "Process Fabric data using a JavaScript function. The node's ports are set from the typed signature, and the function must return an object keyed by those output names. Types: `Bool`, `Int`, `Number`, `String`, `Vector2`/`3`/`4`, `Color`, `Quaternion`, `Transform`, `Geometry`, `Material`, `Image`, with `Type[]` for an array and `Record<string, Type>` for a dictionary. `context` is in scope, carrying `time`, `deltaTime`, `displayTime`, `systemTime`, `frameNumber`, `iterationIndex` and `iterationCount`.",
+                guide: "[JavaScript node guide ↗](https://github.com/Fabric-Project/Fabric/blob/main/Fabric/Nodes/Utility/JavaScriptNodeGuidance.markdown)")
+
+            HStack
+            {
+                LabeledContent("Execution") {
+                    Text(self.editorModel.executionMode.rawValue)
+                        .foregroundStyle(.secondary)
+                }
+
+                Picker("Time", selection: self.$editorModel.selectedTimeMode) {
+                    Text("None").tag(Node.TimeMode.None)
+                    Text("Idle").tag(Node.TimeMode.Idle)
+                    Text("Time Base").tag(Node.TimeMode.TimeBase)
+                }
+                .pickerStyle(.segmented)
+            }
+
+            CodeEditor(text: self.$editorModel.content,
+                       position: self.$position,
+                       messages: self.$editorModel.messages,
+                       language: .javaScriptLanguage(self.editorModel.languageService))
+            .codeEditorChrome()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onChange(of: self.editorModel.content) { _, _ in
+                self.editorModel.scheduleSave()
+            }
+            .onChange(of: self.editorModel.selectedTimeMode) { _, _ in
+                self.editorModel.scheduleSave()
+            }
+
+            if self.editorModel.diagnostics.isEmpty == false {
+                GroupBox("Diagnostics")
+                {
+                    ScrollView
+                    {
+                        VStack(alignment: .leading, spacing: 8)
+                        {
+                            ForEach(Array(self.editorModel.diagnostics.enumerated()), id: \.offset) { _, diagnostic in
+                                let lineColumn = "L\(diagnostic.line + 1):C\(diagnostic.column + 1)"
+                                Text("\(lineColumn) \(diagnostic.summary)")
+                                    .font(.caption.monospaced())
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 110)
+                }
+            }
+        }
+        .onDisappear {
+            self.editorModel.flush()
+        }
+    }
+}

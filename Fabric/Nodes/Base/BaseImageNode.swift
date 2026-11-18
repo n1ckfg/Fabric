@@ -1,0 +1,658 @@
+import Foundation
+import Metal
+import MetalKit
+import Satin
+import simd
+import UniformTypeIdentifiers
+
+open class BaseImageNode: Node, NodeFileLoadingProtocol
+{
+    open class var supportedContentTypes: [UTType] { [] }
+    
+    override open class var name: String { "Base Image" }
+    override open class var nodeType: Node.NodeType { .Image(imageType: .BaseEffect) }
+    override open class var nodeExecutionMode: Node.ExecutionMode { .Processor }
+    override open class var nodeTimeMode: Node.TimeMode { .None }
+    override open class var nodeDescription: String { "Image processing effect" }
+
+    override public func deriveTitle() -> String { self.cachedFileURLName ?? Self.name }
+
+    open class var sourceShaderName: String { "" }
+
+    /// Where the class's shader ships. The default resolves `sourceShaderName`
+    /// from Fabric's Shaders directory; a subclass in a plugin overrides this to
+    /// its own bundle, which init and decode then resolve against.
+    open class var sourceShaderURL: URL? {
+        Bundle.module.url(forResource: sourceShaderName, withExtension: "metal", subdirectory: "Shaders")
+    }
+
+    open class var defaultImageInputCountHint: Int? { nil }
+
+    /// Overrides shader-reflected image input discovery for nodes that bind
+    /// additional textures internally rather than exposing them as ports.
+    open class var fixedImageInputCount: Int? { nil }
+
+    open class PostMaterial: SourceMaterial {}
+
+    let postMaterial: PostMaterial
+    let postProcessor: PostProcessEncoder
+
+    private var url: URL? = nil
+    private var cachedFileURLName: String?
+    private var lastKnownInputCount: Int = 1
+    private var cachedImageInputPorts: [NodePort<FabricImage>] = []
+    private lazy var inputTextureTransformBuffer = StructBuffer<simd_float4x4>(device: self.context.device,
+                                                                               count: 25,
+                                                                               label: "BaseImageNode Input Texture Transforms")
+
+    enum CodingKeys: String, CodingKey
+    {
+        case effectPath
+        case baseImageNodeVersion
+        case lastKnownInputCount
+    }
+
+    // Ports
+    override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
+        let ports = super.registerPorts(context: context)
+
+        return ports + [
+            ("outputImage0", NodePort<FabricImage>(name: "Image", kind: .Outlet, description: "Output image")),
+        ]
+    }
+
+    public var outputTexturePort: NodePort<FabricImage> {
+        if let connected = self.outputImagePorts().first(where: { $0.connections.isEmpty == false }) {
+            return connected
+        }
+
+        if let canonical: NodePort<FabricImage> = self.findPort(named: "outputImage0") {
+            return canonical
+        }
+
+        if let legacy: NodePort<FabricImage> = self.findPort(named: "outputTexturePort") {
+            return legacy
+        }
+
+        if let fallback = self.outputImagePorts().first {
+            return fallback
+        }
+
+        fatalError("BaseImageNode requires at least one image outlet")
+    }
+
+    override public var nodeExecutionMode: ExecutionMode {
+        self.currentImageInputCount == 0 ? .Provider : .Processor
+    }
+
+    public var currentImageInputCount: Int {
+        self.cachedImageInputPorts.count
+    }
+
+    public required init(context: Context, fileURL: URL) throws {
+        self.url = fileURL
+        self.cachedFileURLName = Self.fileURLToName(fileURL: fileURL)
+
+        let material = PostMaterial(context:context, pipelineURL: fileURL)
+
+        self.postMaterial = material
+        self.postProcessor = PostProcessEncoder(context: context,
+                                                material: material,
+                                                depthPixelFormat: .invalid,
+                                                stencilPixelFormat: .invalid,
+                                                frameBufferOnly: false)
+
+        super.init(context: context)
+
+        self.postInit()
+
+        self.postSetupSynchronizePorts(allowReplace: true)
+    }
+
+    public required init(context: Context) {
+        let shaderURL = Self.sourceShaderURL
+
+        let material = PostMaterial(context:context, pipelineURL: shaderURL!)
+
+        self.postMaterial = material
+        self.postProcessor = PostProcessEncoder(context: context,
+                                                material: material,
+                                                depthPixelFormat: .invalid,
+                                                stencilPixelFormat: .invalid,
+                                                frameBufferOnly: false)
+
+        super.init(context: context)
+
+        self.postInit()
+
+        self.postSetupSynchronizePorts(allowReplace: false)
+    }
+    
+    public func setFileURL(_ url: URL) {
+        let cachedName = Self.fileURLToName(fileURL: url)
+        let shouldUpdatePipeline = self.url != url
+        guard shouldUpdatePipeline || self.cachedFileURLName != cachedName else { return }
+
+        self.url = url
+        self.cachedFileURLName = cachedName
+        self.updatePostProcessorLabel()
+        self.subtitleSubject.send()
+
+        guard shouldUpdatePipeline else { return }
+
+        if let sourceShader = self.postMaterial.shader as? SourceShader {
+            sourceShader.pipelineURL = url
+            sourceShader.reloadFromSource()
+        }
+
+        // New shader may expose a different set of uniforms.
+        self.syncDynamicParameterPortsFromMaterial()
+    }
+
+    public required init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        guard let context = decoder.context?.documentContext as? Context else {
+            fatalError("Required Decode Context Not set")
+        }
+
+        let decodedEffectPath = try container.decodeIfPresent(String.self, forKey: .effectPath)
+
+        if let path = decodedEffectPath {
+            if let shaderURL = Self.resolveBundleResource(path: path) {
+                self.url = shaderURL
+                self.cachedFileURLName = Self.fileURLToName(fileURL: shaderURL)
+
+                let material = PostMaterial(context:context, pipelineURL: shaderURL)
+
+                self.postMaterial = material
+                self.postProcessor = PostProcessEncoder(context:context,
+                                                        material: material,
+                                                        depthPixelFormat: .invalid,
+                                                        stencilPixelFormat: .invalid,
+                                                        frameBufferOnly: false)
+            }
+            else {
+                self.cachedFileURLName = nil
+
+                let shaderURL = Self.sourceShaderURL
+
+                let material = PostMaterial(context:context,pipelineURL: shaderURL!)
+
+                self.postMaterial = material
+                self.postProcessor = PostProcessEncoder(context:context,
+                                                        material: material,
+                                                        depthPixelFormat: .invalid,
+                                                        stencilPixelFormat: .invalid,
+                                                        frameBufferOnly: false)
+            }
+        }
+        else {
+            self.cachedFileURLName = nil
+
+            let shaderURL = Self.sourceShaderURL
+
+            let material = PostMaterial(context:context,pipelineURL: shaderURL!)
+
+            self.postMaterial = material
+            self.postProcessor = PostProcessEncoder(context:context,
+                                                    material: material,
+                                                    depthPixelFormat: .invalid,
+                                                    stencilPixelFormat: .invalid,
+                                                    frameBufferOnly: false)
+        }
+
+        self.lastKnownInputCount = try container.decodeIfPresent(Int.self, forKey: .lastKnownInputCount)
+            ?? Self.defaultImageInputCountHint
+            ?? Self.defaultInputCountForPath(decodedEffectPath, fallback: 1)
+
+
+        try super.init(from: decoder)
+
+        self.postInit()
+        
+        self.postSetupSynchronizePorts(allowReplace: false)
+    }
+
+    override public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        if let url = self.url {
+            try container.encodeIfPresent(Self.bundleRelativeResourcePath(for: url), forKey: .effectPath)
+        }
+
+        try container.encode(1, forKey: .baseImageNodeVersion)
+        try container.encode(self.currentImageInputCount, forKey: .lastKnownInputCount)
+
+        try super.encode(to: encoder)
+    }
+
+    private func postInit()
+    {
+        self.updatePostProcessorLabel()
+    }
+
+    private func updatePostProcessorLabel()
+    {
+        self.postProcessor.label = self.title + " Post Processor"
+    }
+    
+    open func postSetupSynchronizePorts(allowReplace: Bool) {
+        let inferredInputCount = Self.fixedImageInputCount
+            ?? self.inferInputCountFromShader()
+            ?? self.lastKnownInputCount
+        self.lastKnownInputCount = max(0, inferredInputCount)
+
+        self.syncImageInputPorts(targetCount: self.lastKnownInputCount, allowReplace: allowReplace)
+        self.synchronizeOutputImagePorts()
+
+        self.syncGeneratorResolutionPorts()
+
+        self.syncDynamicParameterPortsFromMaterial()
+        self.normalizePortOrderForDisplay()
+    }
+
+    private func outputImagePorts() -> [NodePort<FabricImage>] {
+        self.ports.compactMap { port -> NodePort<FabricImage>? in
+            guard port.kind == .Outlet,
+                  port.portType == .Image,
+                  port.parameter == nil else {
+                return nil
+            }
+
+            return port as? NodePort<FabricImage>
+        }
+    }
+
+    private func shouldPreferOutputPort(_ port: NodePort<FabricImage>) -> Int {
+        if port.connections.isEmpty == false {
+            return 0
+        }
+
+        if port.name == "outputImage0" {
+            return 1
+        }
+
+        if port.name == "outputTexturePort" {
+            return 2
+        }
+
+        if port.name == "outputImage" {
+            return 3
+        }
+
+        return 10
+    }
+
+    private func synchronizeOutputImagePorts() {
+        var imageOutputs = self.outputImagePorts()
+        guard imageOutputs.count > 1 else { return }
+
+        let canonicalPort = (self.findPort(named: "outputImage0") as? NodePort<FabricImage>)
+            ?? imageOutputs.min { lhs, rhs in
+                let lhsRank = self.shouldPreferOutputPort(lhs)
+                let rhsRank = self.shouldPreferOutputPort(rhs)
+                if lhsRank == rhsRank {
+                    return lhs.connections.count > rhs.connections.count
+                }
+                return lhsRank < rhsRank
+            }
+
+        guard let canonicalPort else { return }
+
+        for legacyPort in imageOutputs where legacyPort.id != canonicalPort.id {
+            if legacyPort.published {
+                canonicalPort.published = true
+            }
+
+            let inboundConnections = legacyPort.connectedInlets
+            for inlet in inboundConnections {
+                self.graph?.connect(canonicalPort, to: inlet)
+            }
+        }
+
+        imageOutputs = self.outputImagePorts()
+        for legacyPort in imageOutputs where legacyPort.id != canonicalPort.id {
+            if legacyPort.connections.isEmpty {
+                self.removePort(legacyPort)
+            }
+        }
+    }
+    
+    private func defaultInputCountForFilePath() -> Int {
+        guard let url else {
+            return Self.defaultImageInputCountHint ?? 1
+        }
+        return Self.defaultInputCountForPath(url.path(percentEncoded: false), fallback: Self.defaultImageInputCountHint ?? 1)
+    }
+
+    private static func defaultInputCountForPath(_ path: String?, fallback: Int) -> Int {
+        guard let path else { return fallback }
+        if path.localizedStandardContains("EffectsTwoChannel") {
+            return 2
+        }
+        if path.localizedStandardContains("EffectsThreeChannel") {
+            return 3
+        }
+        if path.localizedStandardContains("Effects/Generator") || path.localizedStandardContains("Effects/ShapeGenerator") {
+            return 0
+        }
+        return fallback
+    }
+
+    private func inferInputCountFromShader() -> Int? {
+        guard let shader = self.postMaterial.shader as? SourceShader else {
+            return nil
+        }
+
+        if shader.pipelineError != nil {
+            return nil
+        }
+
+        let customIndices = shader.fragmentTextureBindingIsUsed
+            .map(\.rawValue)
+            .filter { $0 >= FragmentTextureIndex.Custom0.rawValue && $0 <= FragmentTextureIndex.Custom24.rawValue }
+
+        guard let maxIndex = customIndices.max() else {
+            return 0
+        }
+
+        return max(0, maxIndex + 1)
+    }
+
+    private func makeInputPort(index: Int) -> NodePort<FabricImage> {
+        let label = index == 0 ? "Image" : "Image \(index + 1)"
+        return NodePort<FabricImage>(name: label,
+                                     kind: .Inlet,
+                                     description: "Input image \(index + 1)")
+    }
+
+    func imageInputPorts() -> [NodePort<FabricImage>] {
+        self.cachedImageInputPorts
+    }
+
+    private func refreshImageInputPortCache() {
+        let ports = self.ports.compactMap { port -> NodePort<FabricImage>? in
+            guard port.kind == .Inlet,
+                  port.portType == .Image,
+                  port.parameter == nil else {
+                return nil
+            }
+
+            return port as? NodePort<FabricImage>
+        }
+
+        self.cachedImageInputPorts = ports.sorted { lhs, rhs in
+            self.imagePortSortKey(for: lhs) < self.imagePortSortKey(for: rhs)
+        }
+    }
+
+    private func imagePortSortKey(for port: Port) -> Int {
+        if let index = Self.extractTrailingInteger(from: port.name) {
+            return index
+        }
+
+        if port.name == "Image" || port.name == "inputTexturePort" {
+            return 0
+        }
+
+        if port.name == "inputTexture2Port" { return 1 }
+        if port.name == "inputTexture3Port" { return 2 }
+
+        return 10_000
+    }
+
+    private static func extractTrailingInteger(from text: String) -> Int? {
+        let digits = text.reversed().prefix { $0.isNumber }
+        guard digits.isEmpty == false else { return nil }
+        let value = String(digits.reversed())
+        return Int(value).map { max(0, $0 - 1) }
+    }
+
+    private func syncImageInputPorts(targetCount: Int, allowReplace: Bool) {
+        let clampedCount = max(0, targetCount)
+        self.refreshImageInputPortCache()
+        let existingPorts = self.cachedImageInputPorts
+
+        if allowReplace == false {
+            if existingPorts.count < clampedCount {
+                for index in existingPorts.count..<clampedCount {
+                    let newPort = self.makeInputPort(index: index)
+                    self.addDynamicPort(newPort, name: newPort.name)
+                }
+            }
+            else if existingPorts.count > clampedCount {
+                for index in stride(from: existingPorts.count - 1, through: clampedCount, by: -1) {
+                    self.removePort(existingPorts[index])
+                }
+            }
+            self.refreshImageInputPortCache()
+            return
+        }
+
+        for port in existingPorts {
+            self.removePort(port)
+        }
+
+        for index in 0..<clampedCount {
+            let newPort = self.makeInputPort(index: index)
+            self.addDynamicPort(newPort, name: newPort.name)
+        }
+        self.refreshImageInputPortCache()
+    }
+
+    /// Ports the base class manages for generator nodes (image input count == 0).
+    /// Single source of truth: `syncGeneratorResolutionPorts` adds/removes them
+    /// from this list, and `offLimitsLabels` reads their labels to protect them
+    /// from material sync.
+    private static let generatorResolutionPorts: [(label: String, defaultValue: Int, description: String)] = [
+        ("Width",  512, "Output image width in pixels"),
+        ("Height", 512, "Output image height in pixels"),
+    ]
+
+    private func syncGeneratorResolutionPorts() {
+        let shouldHaveResolutionPorts = self.currentImageInputCount == 0
+
+        for spec in Self.generatorResolutionPorts {
+            let existing = self.resolutionPort(label: spec.label)
+
+            if shouldHaveResolutionPorts {
+                if existing == nil {
+                    let port = ParameterPort(parameter: IntParameter(spec.label, spec.defaultValue, 1, 8192, .inputfield, spec.description))
+                    self.addDynamicPort(port, name: port.name)
+                }
+            }
+            else if let existing {
+                self.removePort(existing)
+            }
+        }
+    }
+
+    private func resolutionPort(label: String) -> ParameterPort<Int>? {
+        self.ports.first(where: { $0.parameter?.label == label }) as? ParameterPort<Int>
+    }
+
+    func inputImage(at index: Int) -> FabricImage? {
+        let ports = self.imageInputPorts()
+        guard index >= 0, index < ports.count else {
+            return nil
+        }
+
+        return ports[index].value
+    }
+
+    /// Labels of parameter ports that have been claimed by `syncDynamicParameterPortsFromMaterial`.
+    /// Material sync only adds to, rebinds, or removes labels in this set — any
+    /// port whose label isn't in it (subclass-declared ports, base-managed ports
+    /// like Width/Height, or anything else) is implicitly protected.
+    private var materialSyncedLabels: Set<String> = []
+    private var materialSyncedLabelsInitialized: Bool = false
+
+    private func offLimitsLabels() -> Set<String> {
+        let declared = Self.registerPorts(context: self.context).compactMap { $0.port.parameter?.label }
+        let baseManaged = Self.generatorResolutionPorts.map { $0.label }
+        return Set(declared).union(baseManaged)
+    }
+
+    private func syncDynamicParameterPortsFromMaterial() {
+        let materialParams = self.postMaterial.parameters.params
+        let newLabels = Set(materialParams.map(\.label))
+        let offLimits = self.offLimitsLabels()
+
+        // Seed the tracked set on the first sync after init/decode: any existing
+        // parameter port whose label isn't declared or base-managed must have
+        // been added by a prior material sync.
+        if self.materialSyncedLabelsInitialized == false {
+            let existingParamLabels = Set(self.ports.compactMap { $0.parameter?.label })
+            self.materialSyncedLabels = existingParamLabels.subtracting(offLimits)
+            self.materialSyncedLabelsInitialized = true
+        }
+
+        let labelsToRemove = self.materialSyncedLabels.subtracting(newLabels)
+        let portsToRemove = self.ports.filter { port in
+            if let label = port.parameter?.label {
+                return labelsToRemove.contains(label)
+            }
+
+            return labelsToRemove.contains(port.name)
+        }
+
+        for port in portsToRemove {
+            self.removePort(port)
+        }
+
+        for param in materialParams {
+            if offLimits.contains(param.label) {
+                continue
+            }
+
+            if let existingPort = self.ports.first(where: { $0.name == param.label }) {
+                if existingPort.parameter != nil {
+                    self.replaceParameterOfPort(existingPort, withParam: param)
+                }
+                else if let freshPort = PortType.port(for: param, id: existingPort.id) {
+                    // The document's own port, adopted while the shader would
+                    // not compile; a plain one cannot carry the parameter.
+                    self.replacePort(existingPort, with: freshPort)
+                }
+            }
+            else if let freshPort = PortType.port(for: param) {
+                self.addDynamicPort(freshPort)
+            }
+        }
+
+        self.materialSyncedLabels = newLabels.subtracting(offLimits)
+    }
+
+    private func normalizePortOrderForDisplay()
+    {
+        let currentPorts = self.ports
+        let indexByID = Dictionary(uniqueKeysWithValues: currentPorts.enumerated().map { ($1.id, $0) })
+
+        let reordered = currentPorts.sorted { lhs, rhs in
+            let lhsKey = self.portSortKey(lhs, indexByID: indexByID)
+            let rhsKey = self.portSortKey(rhs, indexByID: indexByID)
+            if lhsKey.group == rhsKey.group {
+                return lhsKey.position < rhsKey.position
+            }
+            return lhsKey.group < rhsKey.group
+        }
+
+        if zip(currentPorts, reordered).allSatisfy({ $0.id == $1.id }) {
+            return
+        }
+
+        self.reorderPorts(reordered)
+        self.refreshImageInputPortCache()
+    }
+
+    private func portSortKey(_ port: Port, indexByID: [UUID: Int]) -> (group: Int, position: Int) {
+        let originalIndex = indexByID[port.id] ?? 0
+
+        if port.kind == .Inlet && port.direction == .Horizontal {
+            if port.portType == .Image {
+                return (0, self.imagePortSortKey(for: port))
+            }
+            if self.materialSyncedLabels.contains(port.name) {
+                return (2, originalIndex)
+            }
+            return (1, originalIndex)
+        }
+
+        return (3, originalIndex)
+    }
+
+    public override func execute(renderer:GraphRenderer, executionInfo:GraphExecutionInfo, renderPassDescriptor: MTLRenderPassDescriptor, commandBuffer: MTLCommandBuffer) throws
+    {
+        let shouldExecute = self.ports.reduce(false) { partialResult, next in
+            partialResult || next.valueDidChange
+        }
+
+        commandBuffer.pushDebugGroup(self.debugDescription + " Execute")
+        defer { commandBuffer.popDebugGroup() }
+        
+        if self.currentImageInputCount == 0 {
+            guard let widthPort = self.resolutionPort(label: "Width"),
+                  let heightPort = self.resolutionPort(label: "Height") else {
+                self.outputTexturePort.send(nil)
+                return
+            }
+
+            let width = max(1, widthPort.value ?? 512)
+            let height = max(1, heightPort.value ?? 512)
+
+            self.postProcessor.resize(size: (width: Float(width), height: Float(height)), scaleFactor: 1)
+
+            let outImage = try renderer.newImage(withWidth: width, height: height)
+
+            let renderPassDesc = MTLRenderPassDescriptor()
+            renderPassDesc.colorAttachments[0].texture = outImage.texture
+            
+            try self.postProcessor.draw(frame: executionInfo.timing, renderPassDescriptor: renderPassDesc, commandBuffer: commandBuffer)
+            self.outputTexturePort.send(outImage)
+            return
+        }
+
+        guard shouldExecute else {
+            return
+        }
+
+        guard let inputImage = self.inputImage(at: 0)
+        else {
+            self.outputTexturePort.send(nil)
+            return
+        }
+        
+        let inputTexture0 = inputImage.texture
+        let inputImages = self.imageInputPorts().map(\.value)
+        let textures = inputImages.map { $0?.texture }
+        let outputWidth = Int(inputImage.presentationSize.width.rounded())
+        let outputHeight = Int(inputImage.presentationSize.height.rounded())
+
+        let outImage = try renderer.newImage(withWidth: outputWidth, height: outputHeight)
+
+        let transforms = inputImages.map { $0?.textureTransform ?? inputImage.textureTransform }
+        self.inputTextureTransformBuffer.update(data: transforms)
+        self.postMaterial.set(self.inputTextureTransformBuffer, index: FragmentBufferIndex.Custom10)
+        outImage.textureTransform = matrix_identity_float4x4
+
+        // Recorded with this draw: a later draw of the same material sets its own.
+        for (index, texture) in textures.enumerated() {
+            guard let slot = FragmentTextureIndex(rawValue: FragmentTextureIndex.Custom0.rawValue + index) else { continue }
+            self.postMaterial.set(texture ?? inputTexture0, index: slot)
+        }
+
+        self.postProcessor.resize(size: (width: Float(outputWidth), height: Float(outputHeight)), scaleFactor: 1)
+
+        let renderPassDesc = MTLRenderPassDescriptor()
+        renderPassDesc.colorAttachments[0].texture = outImage.texture
+
+        try self.postProcessor.draw(frame: executionInfo.timing, renderPassDescriptor: renderPassDesc, commandBuffer: commandBuffer)
+        self.outputTexturePort.send(outImage)
+    }
+
+    private static func fileURLToName(fileURL: URL) -> String {
+        let nodeName = fileURL.deletingPathExtension().lastPathComponent.replacing("ImageNode", with: "")
+        return nodeName.titleCase
+    }
+}

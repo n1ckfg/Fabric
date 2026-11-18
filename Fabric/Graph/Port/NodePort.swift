@@ -8,21 +8,16 @@
 import CoreFoundation
 import SwiftUI
 import Satin
+import simd
 
 // Specialized port which facilitates sending a concrete type supported by Fabric .
+
 public class NodePort<Value : PortValueRepresentable>: Port
 {
-    // BARF
-    override internal func boxedValue() -> PortValue? { self.value?.toPortValue() }
-    
-    override  internal func setBoxedValue(_ boxed: PortValue?)
-    {
-//        guard let boxed else { self.send(nil, force: true); return }
-//        
-//        self.send(Value.fromPortValue(boxed), force: true)
+    override internal func snapshotValue() -> PortValue? { self.value?.toPortValue() }
 
-        
-        // Assign w/o propogating via send
+    override internal func restoreValue(from boxed: PortValue?)
+    {
         if let boxed
         {
             self.value = Value.fromPortValue(boxed)
@@ -31,13 +26,30 @@ public class NodePort<Value : PortValueRepresentable>: Port
         {
             self.value = nil
         }
+    }
 
-        // Force execution to see this value even if Equatable says “same”
-        self.valueDidChange = true
-        self.node?.markDirty()
+    override internal func sendBoxed(_ boxed: PortValue?)
+    {
+        sendBoxed(boxed, force: false)
+    }
+
+    override internal func sendBoxed(_ boxed: PortValue?, force: Bool)
+    {
+        if let boxed
+        {
+            if let value = Value.fromPortValue(boxed) { self.send(value, force: force) }
+            // Type mismatch — don't send anything.
+        }
+        else
+        {
+            self.send(nil, force: force)
+        }
     }
     
-    public var value: Value?
+    /// Final so reads in specialized code skip the vtable: an overridable getter runs
+    /// unspecialized and looks up `Optional<Value>` metadata on every read.
+    /// Subclasses react to assignments in `valueDidSet()` instead of overriding this.
+    public final var value: Value?
     {
         didSet
         {
@@ -48,11 +60,30 @@ public class NodePort<Value : PortValueRepresentable>: Port
             //   - it wont if we do an additional equality check here!
             self.valueDidChange = true
             self.node?.markDirty()
+            self.onValueChanged?()
+            self.valueDidSet()
         }
     }
+
+    /// Runs after every assignment to `value`, once its change bookkeeping is done.
+    /// Overrides call `super` to keep a publishing proxy in step.
+    internal func valueDidSet()
+    {
+        self.publishingProxy?.mirrorInnerValue(self.value)
+    }
+
+    /// The proxy publishing this port from its subgraph. Unowned so ports avoid side
+    /// tables; the proxy clears it as it deinitializes.
+    internal unowned var publishingProxy: ProxyPort<Value>?
+    {
+        didSet { self.publishingProxyIdentifier = self.publishingProxy.map(ObjectIdentifier.init) }
+    }
+
+    /// Lets a deinitializing proxy recognize itself without loading the unowned reference.
+    internal private(set) var publishingProxyIdentifier: ObjectIdentifier?
         
     public var valueType: Any.Type { Value.self }
-    
+
     @ObservationIgnored override public var portType: PortType {
         Value.portType
     }
@@ -86,223 +117,71 @@ public class NodePort<Value : PortValueRepresentable>: Port
     deinit
     {
         self.teardown()
-        self.disconnectAll()
-        self.connections.removeAll()
-    }
-    
-    override public func disconnectAll()
-    {
-        self.connections.forEach { [weak self] in  self?.disconnect(from: $0) }
-    }
-    
-    override public func disconnect(from other: Port)
-    {
-        if let other = other as? NodePort<Value>
-        {
-            self.send(nil, to:other, force: true)
-            self.validatedDisconnect(from: other)
-        }
-        // In theory we can use this for type casting port to port?
-        else if let other = other as? NodePort<PortValue>
-        {
-            self.send(nil, to:other, force: true)
-            self.validatedDisconnect(from: other)
-        }
-        else
-        {
-//            print("Disconnect Port \(self) Unable to Send Nil to \(other)")
-//            self.send(nil, to:other, force: true)
-            self.validatedDisconnect(from: other)
-
-        }
-    }
-    
-    private func validatedDisconnect(from other: Port)
-    {
-//        print("Port \(self) Disconnect from \(other)")
-
-        if let node = self.node,
-           let otherNode = other.node
-        {
-            node.didDisconnectFromNode(otherNode)
-            otherNode.didDisconnectFromNode(node)
-        }
-        
-        if other.kind == .Inlet
-        {
-            other.connections.removeAll()
-        }
-        else
-        {
-            while let index = other.connections.firstIndex(where: { $0.id == other.id } )
-            {
-                other.connections.remove(at: index)
-            }
-        }
-        
-        if self.kind == .Inlet
-        {
-            self.connections.removeAll()
-        }
-        else
-        {
-            while let index = self.connections.firstIndex(where: { $0.id == other.id } )
-            {
-                self.connections.remove(at: index)
-            }
-        }
-        
-//        print("Connections: \(self.debugDescription)) - \(self.connections)")
-//        print("Connections: \(other.debugDescription) - \(other.connections)")
-        
-        self.node?.graph?.undoManager?.registerUndo(withTarget: self) { port in
-            port.connect(to: other)
-        }
-        self.node?.graph?.undoManager?.setActionName("Disconnect Ports")
-        self.node?.graph?.shouldUpdateConnections.toggle()
-    }
-
-    override public func connect(to other: Port)
-    {
-        if let other = other as? NodePort<Value>
-        {
-            self.connect(to: other)
-        }
-        
-        // In theory we can use this for type casting port to port?
-        else if let other = other as? NodePort<PortValue>
-        {
-            self.connect(to: other)
-        }
-      
-        else
-        {
-//            print("Port \(self) Unable to connect to \(other)")
-            self.validatedConnect(to: other)
-        }
-    }
-    
-    public func connect(to other: NodePort<Value>)
-    {
-        self.validatedConnect(to:other)
-    }
-    
-    public func connect(to other: NodePort<PortValue>)
-    {
-        self.validatedConnect(to:other)
-    }
-        
-    private func validatedConnect(to other:  Port)
-    {
-//        print("Port \(self) Connect to \(other)")
-
-        if self.kind == other.kind
-        {
-            return
-        }
-        
-        if self.kind == .Inlet && other.kind == .Outlet
-        {
-            self.connections.forEach { [weak self] in
-                
-                guard let self else { return }
-                    
-                $0.disconnect(from: self)
-            }
-            
-            self.connections.removeAll()
-            self.connections.append(other)
-            other.connections.append(self)
-        }
-        else if self.kind == .Outlet && other.kind == .Inlet
-        {
-            other.connections.forEach {
-                $0.disconnect(from: other)
-            }
-            
-            other.connections.removeAll()
-            other.connections.append(self)
-            self.connections.append(other)
-        }
-        
-        // TODO = This isnt QUITE right...
-        
-//        // We can't be published if we have an input connection...
-//        // Output Ports can be published if connected.
-//        
-//        // So
-//        if self.kind == .Inlet
-//        {
-//            self.published = false
-//        }
-        
-        if let node = self.node,
-           let otherNode = other.node
-        {
-//            // This forces a ping to recompute if we need to
-//            node.markDirty()
-            node.didConnectToNode(otherNode)
-            otherNode.didConnectToNode(node)
-        }
-        
-//        print("Connections: \(self.debugDescription)) - \(self.connections)")
-//        print("Connections: \(other.debugDescription) - \(other.connections)")
-
-        self.send(self.value, force: true)
-
-        self.node?.graph?.undoManager?.registerUndo(withTarget: self) { port in
-            port.disconnect(from: other)
-        }
-        self.node?.graph?.undoManager?.setActionName("Connect Ports")
-        self.node?.graph?.shouldUpdateConnections.toggle()
     }
 
     public func send(_ v: Value?, force:Bool = false)
     {
+        if deferredSendCapture?.stage(v, port: self, index: deferredOutputIndex, force: force) == true { return }
         if self.value != v || force
         {
             self.value = v
             
-            for p in connections.filter( { $0.kind == .Inlet })
+            for connection in connections
             {
-                if let p = p as? NodePort<Value>
+                guard connection.outletPortID == id,
+                      let inlet = connection.inletPort
+                else { continue }
+
+                if let inlet = inlet as? NodePort<Value>
                 {
-                    self.send(v, to:p, force: force)
+                    self.send(v, to:inlet, force: force)
+                    continue
                 }
-                
-                else if
-                    let v = v,
-                    v.canConvertTo(other: p.portType)
+
+                if let v
                 {
-                    if let converted = v.convertTo(other: p.portType) as? Bool,
-                       let p = p as? NodePort<Bool>
+                    let destinationType = inlet.portType
+                    if v.canConvertTo(other: destinationType)
                     {
-                        self.send(converted, to:p, force: force)
-                    }
-                    
-                    else if let converted = v.convertTo(other: p.portType) as? Int,
-                       let p = p as? NodePort<Int>
-                    {
-                        self.send(converted, to:p, force: force)
-                    }
-                    
-                    else if let converted = v.convertTo(other: p.portType) as? Float,
-                       let p = p as? NodePort<Float>
-                    {
-                        self.send(converted, to:p, force: force)
-                    }
-                    
-                    else if let converted = v.convertTo(other: p.portType) as? String,
-                       let p = p as? NodePort<String>
-                    {
-                        self.send(converted, to:p, force: force)
+                        let convertedValue = v.convertTo(other: destinationType)
+                        if let converted = convertedValue as? Bool,
+                           let inlet = inlet as? NodePort<Bool>
+                        {
+                            self.send(converted, to:inlet, force: force)
+                        }
+
+                        else if let converted = convertedValue as? Int,
+                           let inlet = inlet as? NodePort<Int>
+                        {
+                            self.send(converted, to:inlet, force: force)
+                        }
+
+                        else if let converted = convertedValue as? Float,
+                           let inlet = inlet as? NodePort<Float>
+                        {
+                            self.send(converted, to:inlet, force: force)
+                        }
+
+                        else if let converted = convertedValue as? String,
+                           let inlet = inlet as? NodePort<String>
+                        {
+                            self.send(converted, to:inlet, force: force)
+                        }
+                        continue
                     }
                 }
 
                 // Our new boxed virtual
-                else if let p = p as? NodePort<PortValue>
+                if let inlet = inlet as? NodePort<PortValue>
                 {
-                    self.send(v?.toPortValue(), to:p, force: force)
+                    self.send(v?.toPortValue(), to:inlet, force: force)
+                }
+
+                // Virtual → typed fallback: let the target port unbox via fromPortValue.
+                // Handles e.g. NodePort<PortValue> outlet → NodePort<ContiguousArray<T>> inlet.
+                else
+                {
+                    inlet.sendBoxed(v?.toPortValue())
                 }
             }
         }
@@ -310,12 +189,10 @@ public class NodePort<Value : PortValueRepresentable>: Port
     
     private func send(_ v:Value?, to other: NodePort<Value>, force:Bool = false)
     {
-        if other.value != v || force
-        {
-            other.value = v
-        }
+        // Specialized version
+       _send(v, to: other, force: force)
     }
-    
+
     private func send(_ v:Bool?, to other: NodePort<Bool>, force:Bool = false)
     {
         if other.value != v || force
@@ -334,7 +211,11 @@ public class NodePort<Value : PortValueRepresentable>: Port
     
     private func send(_ v:Float?, to other: NodePort<Float>, force:Bool = false)
     {
-        if other.value != v || force
+        let isNotNan = !(v?.isNaN ?? false)
+        let isNotInf = !(v?.isInfinite ?? false)
+
+        let safe = other.value != v && isNotInf && isNotNan
+        if  safe || force
         {
             other.value = v
         }
@@ -363,7 +244,7 @@ public class NodePort<Value : PortValueRepresentable>: Port
             return Color.nodeTexture
         }
 
-        else if forType == Satin.SatinGeometry.self
+        else if forType == Satin.Geometry.self || forType == Satin.SatinGeometry.self
         {
             return Color.nodeGeometry
         }
@@ -399,5 +280,27 @@ public class NodePort<Value : PortValueRepresentable>: Port
     private static func calcDirection(forType: Any.Type ) -> PortDirection
     {
         return .Horizontal
+    }
+}
+
+extension NodePort
+{
+    @_specialize(exported: true, where Value == Bool)
+    @_specialize(exported: true, where Value == Int)
+    @_specialize(exported: true, where Value == Float)
+    @_specialize(exported: true, where Value == String)
+    @_specialize(exported: true, where Value == matrix_float4x4)
+    @_specialize(exported: true, where Value == simd_float3)
+    @_specialize(exported: true, where Value == simd_float3)
+    @_specialize(exported: true, where Value == simd_float4)
+    @_specialize(exported: true, where Value == simd_quatf)
+    @usableFromInline
+    func _send(_ v: Value?, to other: NodePort<Value>, force: Bool = false) {
+        let v = Value.normalizePortValueForSend(v)
+
+        if other.value != v || force
+        {
+            other.value = v
+        }
     }
 }

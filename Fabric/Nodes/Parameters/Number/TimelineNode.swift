@@ -10,11 +10,12 @@ import SwiftUI
 import Metal
 import Satin
 import simd
+import Synchronization
 
 // MARK: - Data Model
 
 /// A single keyframe on a timeline track
-public struct TimelineKeyframe: Codable, Identifiable, Equatable
+public struct TimelineKeyframe: Codable, Identifiable, Equatable, Sendable
 {
     public let id: UUID
     public var time: Float      // 0 to duration
@@ -35,7 +36,7 @@ public struct TimelineKeyframe: Codable, Identifiable, Equatable
 }
 
 /// A timeline track with keyframes
-public struct TimelineTrack: Codable, Identifiable, Equatable
+public struct TimelineTrack: Codable, Identifiable, Equatable, Sendable
 {
     public let id: UUID
     public var name: String
@@ -174,11 +175,58 @@ public struct TimelineTrack: Codable, Identifiable, Equatable
     }
 }
 
+// MARK: - Settings
+
+/// The settings of a Timeline node: its duration and tracks.
+public struct TimelineSettings: NodeSettings
+{
+    public var duration: Float
+    public var tracks: [TimelineTrack]
+
+    public init(duration: Float, tracks: [TimelineTrack])
+    {
+        self.duration = duration
+        self.tracks = tracks
+    }
+
+    /// Named by the first number past the count not in use: a removal leaves
+    /// a gap, and the ports are the tracks' names.
+    public mutating func addTrack()
+    {
+        let names = Set(tracks.map(\.name))
+        var number = tracks.count + 1
+        while names.contains("Track \(number)") { number += 1 }
+        tracks.append(TimelineTrack(name: "Track \(number)", duration: duration))
+    }
+
+    /// Removes the track, unless it is the last.
+    public mutating func removeTrack(id: UUID)
+    {
+        guard tracks.count > 1 else { return }
+        tracks.removeAll { $0.id == id }
+    }
+
+    /// Changes the duration, moving each track's last keyframe with it where
+    /// that keyframe sat at the end.
+    public mutating func setDuration(_ newDuration: Float)
+    {
+        for index in tracks.indices
+        {
+            if let lastIndex = tracks[index].keyframes.indices.last,
+               tracks[index].keyframes[lastIndex].time == duration
+            {
+                tracks[index].keyframes[lastIndex].time = newDuration
+            }
+        }
+        duration = newDuration
+    }
+}
+
 // MARK: - Settings View
 
 struct TimelineTrackView: View
 {
-    @Bindable var node: TimelineNode
+    @Bindable var model: TimelineNode.SettingsModel
     let trackID: UUID
     let trackHeight: CGFloat = 100
 
@@ -192,8 +240,8 @@ struct TimelineTrackView: View
 
     private var track: TimelineTrack?
     {
-        guard let index = node.indexForTrack(id: trackID) else { return nil }
-        return node.tracks[index]
+        guard let index = model.indexForTrack(id: trackID) else { return nil }
+        return model.tracks[index]
     }
 
     // Coordinate conversion
@@ -201,7 +249,7 @@ struct TimelineTrackView: View
     {
         let padding: CGFloat = 20
         let usableWidth = width - 2 * padding
-        return padding + CGFloat(time / node.duration) * usableWidth
+        return padding + CGFloat(time / model.duration) * usableWidth
     }
 
     private func xToTime(_ x: CGFloat, width: CGFloat) -> Float
@@ -209,7 +257,7 @@ struct TimelineTrackView: View
         let padding: CGFloat = 20
         let usableWidth = width - 2 * padding
         let normalizedX = (x - padding) / usableWidth
-        return Float(normalizedX) * node.duration
+        return Float(normalizedX) * model.duration
     }
 
     private func valueToY(_ value: Float, height: CGFloat) -> CGFloat
@@ -243,8 +291,8 @@ struct TimelineTrackView: View
                 HStack
                 {
                     TextField("Track Name", text: Binding(
-                        get: { node.nameForTrack(id: trackID) },
-                        set: { node.updateTrackName(id: trackID, name: $0) }
+                        get: { model.nameForTrack(id: trackID) },
+                        set: { model.updateTrackName(id: trackID, name: $0) }
                     ))
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .frame(width: 120)
@@ -253,13 +301,13 @@ struct TimelineTrackView: View
                     Spacer()
 
                     Button(action: {
-                        node.removeTrack(id: trackID)
+                        model.removeTrack(id: trackID)
                     }) {
                         Image(systemName: "trash")
                             .font(.system(size: 10))
                     }
                     .buttonStyle(.borderless)
-                    .disabled(node.tracks.count <= 1)
+                    .disabled(model.tracks.count <= 1)
                 }
 
                 // Keyframe editor canvas
@@ -365,10 +413,10 @@ struct TimelineTrackView: View
             }
 
             // Vertical time markers
-            let numMarkers = max(2, Int(node.duration))
+            let numMarkers = max(2, Int(model.duration))
             for i in 0...numMarkers
             {
-                let t = Float(i) / Float(numMarkers) * node.duration
+                let t = Float(i) / Float(numMarkers) * model.duration
                 let x = timeToX(t, width: width)
                 var path = Path()
                 path.move(to: CGPoint(x: x, y: 0))
@@ -390,8 +438,8 @@ struct TimelineTrackView: View
             let numSamples = 200
             for i in 0...numSamples
             {
-                let t = Float(i) / Float(numSamples) * node.duration
-                let value = track.evaluate(at: t, duration: node.duration)
+                let t = Float(i) / Float(numSamples) * model.duration
+                let value = track.evaluate(at: t, duration: model.duration)
                 let x = timeToX(t, width: width)
                 let y = valueToY(value, height: height)
 
@@ -412,7 +460,7 @@ struct TimelineTrackView: View
     @ViewBuilder
     private func playhead(width: CGFloat, height: CGFloat) -> some View
     {
-        let clampedTime = max(0, min(node.duration, node.currentTime))
+        let clampedTime = max(0, min(model.duration, model.currentTime))
         let x = timeToX(clampedTime, width: width)
 
         Path { path in
@@ -431,7 +479,7 @@ struct TimelineTrackView: View
         let usableHeight = height - 2 * vertPadding
 
         // Convert time offset to pixel offset
-        let dx = CGFloat(handleTime / node.duration) * usableWidth
+        let dx = CGFloat(handleTime / model.duration) * usableWidth
 
         // Convert value offset to pixel offset (inverted Y, scaled for display range)
         let dy = -CGFloat(handleValue / 1.2) * usableHeight
@@ -447,7 +495,7 @@ struct TimelineTrackView: View
         let vertPadding: CGFloat = 10
         let usableHeight = height - 2 * vertPadding
 
-        let handleTime = Float(dx / usableWidth) * node.duration
+        let handleTime = Float(dx / usableWidth) * model.duration
         let handleValue = Float(-dy / usableHeight) * 1.2
 
         return (max(0.01, handleTime), handleValue)
@@ -500,10 +548,10 @@ struct TimelineTrackView: View
 
     private func handleSingleClick(at location: CGPoint, width: CGFloat, height: CGFloat, trackID: UUID)
     {
-        guard let trackIndex = node.indexForTrack(id: trackID) else { return }
+        guard let trackIndex = model.indexForTrack(id: trackID) else { return }
 
         // Check if clicking on existing keyframe
-        let track = node.tracks[trackIndex]
+        let track = model.tracks[trackIndex]
         for keyframe in track.keyframes
         {
             let kx = timeToX(keyframe.time, width: width)
@@ -518,16 +566,16 @@ struct TimelineTrackView: View
         }
 
         // Add new keyframe at click position
-        let time = max(0, min(node.duration, xToTime(location.x, width: width)))
+        let time = max(0, min(model.duration, xToTime(location.x, width: width)))
         let value = max(0, min(1, yToValue(location.y, height: height)))
-        node.tracks[trackIndex].addKeyframe(at: time, value: value)
+        model.tracks[trackIndex].addKeyframe(at: time, value: value)
     }
 
     private func handleDoubleClick(at location: CGPoint, width: CGFloat, height: CGFloat, trackID: UUID)
     {
-        guard let trackIndex = node.indexForTrack(id: trackID) else { return }
+        guard let trackIndex = model.indexForTrack(id: trackID) else { return }
 
-        let track = node.tracks[trackIndex]
+        let track = model.tracks[trackIndex]
 
         // Find keyframe near click
         for keyframe in track.keyframes
@@ -541,7 +589,7 @@ struct TimelineTrackView: View
                 // Don't delete if it's the only keyframe or one of two
                 if track.keyframes.count > 2
                 {
-                    node.tracks[trackIndex].removeKeyframe(id: keyframe.id)
+                    model.tracks[trackIndex].removeKeyframe(id: keyframe.id)
                 }
                 return
             }
@@ -550,7 +598,7 @@ struct TimelineTrackView: View
 
     private func handleDrag(value: DragGesture.Value, width: CGFloat, height: CGFloat, trackID: UUID)
     {
-        guard let trackIndex = node.indexForTrack(id: trackID) else
+        guard let trackIndex = model.indexForTrack(id: trackID) else
         {
             draggingKeyframe = nil
             draggingTangent = nil
@@ -560,14 +608,14 @@ struct TimelineTrackView: View
         }
 
         let location = value.location
-        let track = node.tracks[trackIndex]
+        let track = model.tracks[trackIndex]
 
         // If already dragging something, continue
         if let keyframeID = draggingKeyframe
         {
-            let time = max(0, min(node.duration, xToTime(location.x, width: width)))
+            let time = max(0, min(model.duration, xToTime(location.x, width: width)))
             let val = max(0, min(1, yToValue(location.y, height: height)))
-            node.tracks[trackIndex].updateKeyframe(id: keyframeID, time: time, value: val)
+            model.tracks[trackIndex].updateKeyframe(id: keyframeID, time: time, value: val)
             return
         }
 
@@ -596,7 +644,7 @@ struct TimelineTrackView: View
 
                 // Convert pixel offset to handle time/value
                 let (handleTime, handleValue) = pixelToHandle(dx: dx, dy: dy, width: width, height: height)
-                node.tracks[trackIndex].updateKeyframe(id: tangentID, handleTime: handleTime, handleValue: handleValue)
+                model.tracks[trackIndex].updateKeyframe(id: tangentID, handleTime: handleTime, handleValue: handleValue)
             }
             return
         }
@@ -637,7 +685,7 @@ struct TimelineTrackView: View
 
 struct TimelineNodeView: View
 {
-    @Bindable var node: TimelineNode
+    @Bindable var model: TimelineNode.SettingsModel
 
     var body: some View
     {
@@ -655,14 +703,14 @@ struct TimelineNodeView: View
                 Text("Duration:")
                     .font(.system(size: 10))
 
-                TextField("", value: $node.duration, format: .number)
+                TextField("", value: $model.duration, format: .number)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .frame(width: 60)
                     .font(.system(size: 10))
 
                 Button("+Track")
                 {
-                    node.addTrack()
+                    model.addTrack()
                 }
                 .controlSize(.small)
             }
@@ -674,8 +722,8 @@ struct TimelineNodeView: View
             {
                 VStack(alignment: .leading, spacing: 12)
                 {
-                    ForEach(node.tracks) { track in
-                        TimelineTrackView(node: node, trackID: track.id)
+                    ForEach(model.tracks) { track in
+                        TimelineTrackView(model: model, trackID: track.id)
                     }
                 }
             }
@@ -686,7 +734,7 @@ struct TimelineNodeView: View
 
 // MARK: - Timeline Node
 
-@Observable public class TimelineNode: Node
+public class TimelineNode: Node
 {
     override public static var name: String { "Timeline" }
     override public static var nodeType: Node.NodeType { .Parameter(parameterType: .Number) }
@@ -697,16 +745,16 @@ struct TimelineNodeView: View
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
-        
+
         return ports +
         [
             ("inputTime", ParameterPort(parameter: FloatParameter("Time", 0.0, .inputfield, "Current playback time for evaluating the timeline"))),
         ]
     }
-    
+
     // Port Proxy
     public var inputTime:ParameterPort<Float> { port(named: "inputTime") }
-    
+
     // MARK: - Codable
 
     private enum TimelineCodingKeys: String, CodingKey
@@ -721,25 +769,12 @@ struct TimelineNodeView: View
 
         let container = try decoder.container(keyedBy: TimelineCodingKeys.self)
         self.duration = try container.decodeIfPresent(Float.self, forKey: .duration) ?? 1.0
-        self.tracks = try container.decodeIfPresent([TimelineTrack].self, forKey: .tracks) ?? []
-
-        if tracks.isEmpty
-        {
-            tracks.append(TimelineTrack(name: "Track 1", duration: duration))
-        }
+        self.tracks = Self.tracksOrDefault(try container.decodeIfPresent([TimelineTrack].self, forKey: .tracks) ?? [],
+                                           duration: duration)
 
         // Use sync instead of rebuild to preserve ports decoded by super.init
         // This maintains connection IDs across serialization
         syncPortsToTracks()
-    }
-
-    public override func encode(to encoder: Encoder) throws
-    {
-        try super.encode(to: encoder)
-
-        var container = encoder.container(keyedBy: TimelineCodingKeys.self)
-        try container.encode(self.duration, forKey: .duration)
-        try container.encode(self.tracks, forKey: .tracks)
     }
 
     public required init(context: Context)
@@ -748,7 +783,55 @@ struct TimelineNodeView: View
 
         // Add default track
         tracks.append(TimelineTrack(name: "Track 1", duration: duration))
-        rebuildPorts()
+        syncPortsToTracks()
+    }
+
+    public convenience init(context: Context, duration: Float, tracks: [TimelineTrack])
+    {
+        self.init(context: context)
+        self.apply(TimelineSettings(duration: duration, tracks: tracks))
+    }
+
+    public convenience init(context: Context, settings: TimelineSettings)
+    {
+        self.init(context: context, duration: settings.duration, tracks: settings.tracks)
+    }
+
+    // MARK: - Settings
+
+    override public var settings: (any NodeSettings)? { TimelineSettings(duration: duration, tracks: tracks) }
+
+    override public func apply(_ settings: any NodeSettings)
+    {
+        guard let settings = settings as? TimelineSettings else { return }
+        self.duration = settings.duration
+        self.tracks = Self.tracksOrDefault(settings.tracks, duration: settings.duration)
+        self.syncPortsToTracks()
+        self.reorderPorts(self.inputPorts() + self.tracks.compactMap { self.findPort(named: $0.name) as Port? })
+        self.markDirty()
+        super.apply(settings)
+    }
+
+    /// A timeline always has a track.
+    /// One track at least, and no two of one name, as the ports are the
+    /// tracks' names: a later track with an earlier one's name takes the first
+    /// "Track N" past the count not in use, as addTrack does.
+    private static func tracksOrDefault(_ tracks: [TimelineTrack], duration: Float) -> [TimelineTrack]
+    {
+        guard !tracks.isEmpty else { return [TimelineTrack(name: "Track 1", duration: duration)] }
+        var namesTaken = Set<String>()
+        let namesGiven = Set(tracks.map(\.name))
+        return tracks.map { track in
+            var track = track
+            if namesTaken.contains(track.name)
+            {
+                var number = tracks.count + 1
+                while namesTaken.contains("Track \(number)") || namesGiven.contains("Track \(number)") { number += 1 }
+                track.name = "Track \(number)"
+            }
+            namesTaken.insert(track.name)
+            return track
+        }
     }
 
     // MARK: - Properties
@@ -757,22 +840,99 @@ struct TimelineNodeView: View
     {
         didSet
         {
-            // Update last keyframe of each track to match new duration
-            for i in 0..<tracks.count
-            {
-                if let lastIndex = tracks[i].keyframes.indices.last,
-                   tracks[i].keyframes[lastIndex].time == oldValue
-                {
-                    tracks[i].keyframes[lastIndex].time = duration
-                }
-            }
+            guard oldValue != duration else { return }
+            performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
         }
     }
 
     fileprivate var tracks: [TimelineTrack] = []
+    {
+        didSet
+        {
+            guard oldValue != tracks else { return }
+            performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
+        }
+    }
 
     // Current time for playhead display (updated during execution)
     fileprivate var currentTime: Float = 0
+
+    // MARK: - Settings View
+
+    override public func providesSettingsView() -> Bool { true }
+
+    override public func settingsView() -> AnyView
+    {
+        performOnMainSync
+        {
+            if _settingsModelStorage == nil { _settingsModelStorage = SettingsModel(node: self) }
+            return AnyView(TimelineNodeView(model: _settingsModelStorage!))
+        }
+    }
+
+    override public var settingsSize: SettingsViewSize { .Custom(size: CGSize(width: 800, height: 500)) }
+
+    // MARK: - Settings Model
+
+    @MainActor
+    @Observable final class SettingsModel
+    {
+        var duration: Float
+        {
+            didSet
+            {
+                guard duration != node?.duration else { return }
+                node?.setDuration(duration)
+            }
+        }
+
+        var tracks: [TimelineTrack]
+        {
+            didSet
+            {
+                guard let node, tracks != node.tracks else { return }
+                node.setSettings(TimelineSettings(duration: node.duration, tracks: tracks))
+            }
+        }
+
+        var currentTime: Float = 0
+
+        private weak var node: TimelineNode?
+
+        init(node: TimelineNode)
+        {
+            self.node = node
+            self.duration = node.duration
+            self.tracks = node.tracks
+            self.currentTime = node.currentTime
+        }
+
+        func refreshFromNode()
+        {
+            guard let node else { return }
+            if duration != node.duration { duration = node.duration }
+            if tracks != node.tracks { tracks = node.tracks }
+        }
+
+        func addTrack() { node?.addTrack() }
+        func removeTrack(id: UUID) { node?.removeTrack(id: id) }
+
+        func indexForTrack(id: UUID) -> Int?
+        {
+            tracks.firstIndex(where: { $0.id == id })
+        }
+
+        func nameForTrack(id: UUID) -> String
+        {
+            guard let index = indexForTrack(id: id) else { return "" }
+            return tracks[index].name
+        }
+
+        func updateTrackName(id: UUID, name: String) { node?.updateTrackName(id: id, name: name) }
+    }
+
+    private var _settingsModelStorage: SettingsModel? = nil
+    private let playheadUpdateQueued = Mutex(false)
 
     // MARK: - Ports
 
@@ -804,39 +964,27 @@ struct TimelineNodeView: View
         }
     }
 
-    /// Force rebuild all ports (used when track names change)
-    fileprivate func rebuildPorts()
-    {
-        // Remove all existing output ports
-        let existingOutputs = outputPorts()
-        for port in existingOutputs
-        {
-            removePort(port)
-        }
-
-        // Create output port for each track
-        for track in tracks
-        {
-            let port = NodePort<Float>(name: track.name, kind: .Outlet, description: "Animated value from timeline track")
-            addDynamicPort(port)
-        }
-    }
-
     // MARK: - Track Management
 
     fileprivate func addTrack()
     {
-        let trackNum = tracks.count + 1
-        let track = TimelineTrack(name: "Track \(trackNum)", duration: duration)
-        tracks.append(track)
-        syncPortsToTracks()
+        var settings = TimelineSettings(duration: duration, tracks: tracks)
+        settings.addTrack()
+        setSettings(settings)
     }
 
     fileprivate func removeTrack(id: UUID)
     {
-        guard tracks.count > 1 else { return }
-        tracks.removeAll { $0.id == id }
-        syncPortsToTracks()
+        var settings = TimelineSettings(duration: duration, tracks: tracks)
+        settings.removeTrack(id: id)
+        setSettings(settings)
+    }
+
+    fileprivate func setDuration(_ duration: Float)
+    {
+        var settings = TimelineSettings(duration: self.duration, tracks: tracks)
+        settings.setDuration(duration)
+        setSettings(settings)
     }
 
     fileprivate func indexForTrack(id: UUID) -> Int?
@@ -850,37 +998,44 @@ struct TimelineNodeView: View
         return tracks[index].name
     }
 
-    fileprivate func updateTrackName(id: UUID, name: String)
+    func updateTrackName(id: UUID, name: String)
     {
         guard let index = indexForTrack(id: id) else { return }
-        guard tracks[index].name != name else { return }
-        tracks[index].name = name
-        rebuildPorts()
+        // A port is keyed by its track's name, so two tracks cannot share one.
+        // The field commits each keystroke, so a name passed through on the way
+        // to another leaves the track as it is.
+        guard !tracks.contains(where: { $0.id != id && $0.name == name }) else { return }
+        var settings = TimelineSettings(duration: duration, tracks: tracks)
+        settings.tracks[index].name = name
+        setSettings(settings)
     }
 
-    // MARK: - Settings View
-
-    override public func providesSettingsView() -> Bool
-    {
-        true
-    }
-
-    override public func settingsView() -> AnyView
-    {
-        AnyView(TimelineNodeView(node: self))
-    }
-
-    override public var settingsSize: SettingsViewSize { .Custom(size: CGSize(width: 800, height: 500)) }
     // MARK: - Execution
 
-    public override func execute(context: GraphExecutionContext,
-                                  renderPassDescriptor: MTLRenderPassDescriptor,
-                                  commandBuffer: MTLCommandBuffer)
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
-        let time = self.inputTime.value ?? Float(context.timing.time)
-        
+        let time = self.inputTime.value ?? Float(executionInfo.timing.time)
+
         // Clamp time for display
         currentTime = max(0, min(duration, time))
+        // One update in flight at a time: main shows the time the node holds
+        // when it gets there, not every frame's.
+        if _settingsModelStorage != nil, playheadUpdateQueued.withLock({ queued in
+            if queued { return false }
+            queued = true
+            return true
+        })
+        {
+            performOnMainAsync { [weak self] in
+                guard let self else { return }
+                self.playheadUpdateQueued.withLock { $0 = false }
+                self._settingsModelStorage?.currentTime = self.currentTime
+            }
+        }
 
         // Evaluate each track and send to corresponding port
         for track in tracks

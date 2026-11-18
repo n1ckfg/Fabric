@@ -1,0 +1,123 @@
+//
+//  BlendNode.swift
+//  Fabric
+//
+//  Created by Claude on 4/11/26.
+//
+
+import Foundation
+import Satin
+import simd
+import Metal
+
+public class BlendNode: BaseImageNode
+{
+    override public class var name: String { "Blend" }
+    override public class var nodeType: Node.NodeType { .Image(imageType: .Mix) }
+    override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
+    override public class var nodeTimeMode: Node.TimeMode { .None }
+    override public class var nodeDescription: String { "Blend two images using a selectable blend mode" }
+
+    /// BaseImageNode derives a name from its shader file; Blend is always "Blend"
+    /// (unless the user renames it, which `userName` handles in the base class).
+    override public func deriveSubtitle() -> String? { nil }
+
+    override public class var defaultImageInputCountHint: Int? { 2 }
+
+    required init(context: Context) {
+        guard let url = Bundle.module.url(forResource: "Additive", withExtension: "metal", subdirectory: "EffectsTwoChannel/Mix") else
+        {
+            fatalError("Missing bundled Additive blend shader.")
+        }
+
+        do
+        {
+            try super.init(context: context, fileURL: url)
+        }
+        catch
+        {
+            fatalError("Could not initialize Blend node: \(error.localizedDescription)")
+        }
+    }
+
+    public override class func initWithContext(context: Context) throws -> Node {
+        guard let url = Bundle.module.url(forResource: "Additive", withExtension: "metal", subdirectory: "EffectsTwoChannel/Mix") else
+        {
+            throw FabricError(.loading(.resourceNotFound),
+                              severity: .fatal,
+                              message: "Missing bundled Additive blend shader.")
+        }
+
+        return try Self(context: context, fileURL: url)
+    }
+
+    required init(context: Context, fileURL: URL) throws {
+        try super.init(context: context, fileURL: fileURL)
+    }
+
+    required init(from decoder: any Decoder) throws {
+        try super.init(from: decoder)
+    }
+
+    private static let modeNames: [String] = [
+        "Additive",
+        "Average",
+        "Color",
+        "Color Burn",
+        "Color Dodge",
+        "Darken",
+        "Difference",
+        "Exclusion",
+        "Glow",
+        "Hard Light",
+        "Hard Mix",
+        "Hue",
+        "Lighten",
+        "Linear Burn",
+        "Linear Dodge",
+        "Linear Light",
+        "Luminosity",
+        "Multiply",
+        "Negation",
+        "Overlay",
+        "Phoenix",
+        "Pin Light",
+        "Reflect",
+        "Saturation",
+        "Screen",
+        "Soft Light",
+        "Subtract",
+        "Vivid Light",
+    ]
+
+    // Ports
+    override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
+        let ports = super.registerPorts(context: context)
+
+        return [
+            ("Mode", ParameterPort(parameter: StringParameter("Mode", "Additive", modeNames, .dropdown, "Blend mode"))),
+        ] + ports
+    }
+
+    // Port Proxy
+    public var inputMode: ParameterPort<String> { port(named: "Mode") }
+
+    private func shaderURL(for modeName: String) -> URL? {
+        Bundle.module.url(forResource: modeName, withExtension: "metal", subdirectory: "EffectsTwoChannel/Mix")
+    }
+
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer) throws
+    {
+        if self.inputMode.valueDidChange,
+           let modeName = self.inputMode.value,
+           let url = self.shaderURL(for: modeName)
+        {
+            self.setFileURL(url)
+        }
+
+        try super.execute(renderer: renderer, executionInfo: executionInfo, renderPassDescriptor: renderPassDescriptor, commandBuffer: commandBuffer)
+    }
+}

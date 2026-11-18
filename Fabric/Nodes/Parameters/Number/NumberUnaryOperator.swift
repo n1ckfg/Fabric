@@ -29,7 +29,7 @@ public class NumberUnaryOperator : Node
         [
             ("inputNumber", ParameterPort(parameter: FloatParameter("Number", 0.0, .inputfield, "Input value for the unary operation"))),
             ("inputParam", ParameterPort(parameter: StringParameter("Operator", "Sine", UnaryMathOperator.allCases.map(\.rawValue), .dropdown, "Mathematical function to apply")) ),
-            ("outputNumber", NodePort<Float>(name: NumberNode.name , kind: .Outlet, description: "Result of the unary operation")),
+            ("outputNumber", NodePort<Float>(name: "Number" , kind: .Outlet, description: "Result of the unary operation")),
         ]
     }
     
@@ -40,9 +40,11 @@ public class NumberUnaryOperator : Node
         
     private var mathOperator = UnaryMathOperator.Sine
     
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if  self.inputParam.valueDidChange,
             let param = self.inputParam.value,

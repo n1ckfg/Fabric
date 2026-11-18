@@ -1,3 +1,5 @@
+// description: Twirls the image around a centre point
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -6,6 +8,7 @@ using namespace metal;
 #define SAMPLER sampler( min_filter::linear, mag_filter::linear, address::mirrored_repeat )
 
 #include "../../lygia/sampler.msl"
+#include "../../Shaders/FabricImageTextureTransform.metal"
 
 
 // Uniforms -> Fabric UI sliders
@@ -17,6 +20,7 @@ typedef struct {
 
 fragment half4 postFragment( VertexData                        in        [[stage_in]],
                              constant PostUniforms            &uniforms  [[buffer( FragmentBufferMaterialUniforms )]],
+                             constant float4x4 *imageTransforms [[buffer(FragmentBufferCustom10)]],
                              texture2d<half, access::sample>   renderTex [[texture( FragmentTextureCustom0 )]] )
 {
     // Normalized coordinates [0, 1]
@@ -46,5 +50,5 @@ fragment half4 postFragment( VertexData                        in        [[stage
     float2 uv = normCoord * 0.5f + 0.5f;
 
     // Sample with Lygia sampler helper
-    return SAMPLER_FNC(renderTex, uv);
+    return SAMPLER_FNC(renderTex, fabricTextureCoordinate(imageTransforms[0], uv));
 }

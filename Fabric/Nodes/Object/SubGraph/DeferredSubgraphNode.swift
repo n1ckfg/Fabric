@@ -9,9 +9,82 @@ import Foundation
 import Satin
 import simd
 import Metal
+import SwiftUI
+
+private struct DeferredSubgraphNodeSettingsView: View
+{
+    @Bindable var model: DeferredSubgraphNode.SettingsModel
+
+    var body: some View
+    {
+        VStack(alignment: .leading)
+        {
+            Toggle("Enable Deferred MRT Outputs", isOn: $model.deferredMRTEnabled)
+            Text("Adds auxiliary outputs for albedo, normals, PBR, velocity, and emissive textures using Satin's deferred geometry pipeline.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The settings of a Render To Image and Depth node: whether it hands out the
+/// deferred render targets as well.
+public struct DeferredSubgraphSettings: NodeSettings
+{
+    public var deferredMRTEnabled: Bool
+
+    public init(deferredMRTEnabled: Bool)
+    {
+        self.deferredMRTEnabled = deferredMRTEnabled
+    }
+}
 
 public class DeferredSubgraphNode: SubgraphNode
 {
+    private struct AuxiliaryOutputPortDescriptor
+    {
+        let registryName: String
+        let displayName: String
+        let description: String
+    }
+
+    private enum CodingKeys: String, CodingKey
+    {
+        case deferredMRTEnabled
+    }
+
+    @MainActor
+    @Observable final class SettingsModel {
+        var deferredMRTEnabled: Bool {
+            didSet {
+                guard deferredMRTEnabled != node?.deferredMRTEnabled else { return }
+                node?.setSettings(DeferredSubgraphSettings(deferredMRTEnabled: deferredMRTEnabled))
+            }
+        }
+        private weak var node: DeferredSubgraphNode?
+        init(node: DeferredSubgraphNode) {
+            self.node = node
+            self.deferredMRTEnabled = node.deferredMRTEnabled
+        }
+
+        func refreshFromNode() {
+            guard let node, deferredMRTEnabled != node.deferredMRTEnabled else { return }
+            deferredMRTEnabled = node.deferredMRTEnabled
+        }
+    }
+
+    /// Nil until a settings view asks for it.
+    private var _settingsModelStorage: SettingsModel?
+
+    private static let deferredOutputs: RendererOutputs = [.color, .albedo, .normals, .pbr, .velocity, .emissive]
+    private static let auxiliaryOutputPorts: [AuxiliaryOutputPortDescriptor] = [
+        .init(registryName: "outputAlbedoTexture", displayName: "Albedo Texture", description: "Deferred albedo render target from the subgraph"),
+        .init(registryName: "outputNormalsTexture", displayName: "Normals Texture", description: "Deferred normal render target from the subgraph"),
+        .init(registryName: "outputPBRTexture", displayName: "PBR Texture", description: "Deferred PBR render target from the subgraph"),
+        .init(registryName: "outputVelocityTexture", displayName: "Velocity Texture", description: "Deferred velocity render target from the subgraph"),
+        .init(registryName: "outputEmissiveTexture", displayName: "Emissive Texture", description: "Deferred emissive render target from the subgraph"),
+    ]
+
     public override class var name:String { "Render To Image and Depth" }
     public override class var nodeType: Node.NodeType { .Subgraph }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Consumer }
@@ -24,7 +97,6 @@ public class DeferredSubgraphNode: SubgraphNode
         return  [
             ("inputWidth", ParameterPort(parameter: IntParameter("Width", 1920, .inputfield, "Output texture width in pixels"))),
             ("inputHeight", ParameterPort(parameter: IntParameter("Height", 1080, .inputfield, "Output texture height in pixels"))),
-            ("inputClearColor", ParameterPort(parameter: Float4Parameter("Clear Color", simd_float4(repeating:0), .colorpicker, "Background color for the render target"))),
             ("outputColorTexture", NodePort<FabricImage>(name: "Color Texture", kind: .Outlet, description: "Rendered color output from the subgraph")),
             ("outputDepthTexture", NodePort<FabricImage>(name: "Depth Texture", kind: .Outlet, description: "Rendered depth buffer from the subgraph")),
         ] + ports
@@ -33,7 +105,6 @@ public class DeferredSubgraphNode: SubgraphNode
     // Proxy Port
     public var inputWidth: ParameterPort<Int> { port(named: "inputWidth") }
     public var inputHeight: ParameterPort<Int> { port(named: "inputHeight") }
-    public var inputClearColor: ParameterPort<simd_float4> { port(named: "inputClearColor") }
     public var outputColorTexture: NodePort<FabricImage> { port(named: "outputColorTexture") }
     public var outputDepthTexture: NodePort<FabricImage> { port(named: "outputDepthTexture") }
     
@@ -41,127 +112,307 @@ public class DeferredSubgraphNode: SubgraphNode
         return nil
     }
     
-    let graphRenderer:GraphRenderer
+    private var rendererNeedsSetup = true
+    lazy var graphRenderer:GraphRenderer = self.makeGraphRenderer()
+    internal override var childGraphRenderer: GraphRenderer? { self.graphRenderer }
+
+    public internal(set) var deferredMRTEnabled: Bool = false
+    {
+        didSet
+        {
+            guard oldValue != deferredMRTEnabled else { return }
+            self.synchronizeDeferredConfiguration()
+            self.performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
+        }
+    }
 
     public required init(context: Context)
     {
-        self.graphRenderer = GraphRenderer(context: context)
-        
         super.init(context: context)
+        self.synchronizeDeferredConfiguration()
     }
-    
+
+    public override init(context: Context, subGraph: Graph)
+    {
+        super.init(context: context, subGraph: subGraph)
+        self.synchronizeDeferredConfiguration()
+    }
+
     public required init(from decoder: any Decoder) throws
     {
-        guard let decodeContext = decoder.context else
-        {
-            fatalError("Required Decode Context Not set")
-        }
-
-        self.graphRenderer = GraphRenderer(context: decodeContext.documentContext)
-
         try super.init(from: decoder)
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.deferredMRTEnabled = try container.decodeIfPresent(Bool.self, forKey: .deferredMRTEnabled) ?? false
+        self.synchronizeDeferredConfiguration()
     }
-    
+
+    public convenience init(context: Context, settings: DeferredSubgraphSettings)
+    {
+        self.init(context: context)
+        self.apply(settings)
+    }
+
+    override public var settings: (any NodeSettings)? { DeferredSubgraphSettings(deferredMRTEnabled: deferredMRTEnabled) }
+
+    override public func apply(_ settings: any NodeSettings)
+    {
+        guard let settings = settings as? DeferredSubgraphSettings else { return }
+        self.deferredMRTEnabled = settings.deferredMRTEnabled
+        super.apply(settings)
+    }
+
     private func setupRenderer()
     {
-        self.graphRenderer.renderer.label = "Deferred Subgraph"
-        self.graphRenderer.renderer.colorStoreAction = .store
-        self.graphRenderer.renderer.depthStoreAction = .store
-        self.graphRenderer.renderer.depthLoadAction = .clear
-        self.graphRenderer.renderer.size.width = Float(self.inputWidth.value ?? 1920)
-        self.graphRenderer.renderer.size.height = Float(self.inputHeight.value ?? 1080 )
+        self.graphRenderer.renderEncoder.label = "Deferred Subgraph"
+        self.graphRenderer.renderEncoder.colorStoreAction = .store
+        self.graphRenderer.renderEncoder.depthStoreAction = .store
+        self.graphRenderer.renderEncoder.depthLoadAction = .clear
+        self.graphRenderer.renderEncoder.size.width = Float(self.inputWidth.value ?? 1920)
+        self.graphRenderer.renderEncoder.size.height = Float(self.inputHeight.value ?? 1080 )
         
-        self.graphRenderer.renderer.colorTextureStorageMode = .private
-        self.graphRenderer.renderer.colorMultisampleTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.colorTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.colorMultisampleTextureStorageMode = .private
         
-        self.graphRenderer.renderer.depthTextureStorageMode = .private
-        self.graphRenderer.renderer.depthMultisampleTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.depthTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.depthMultisampleTextureStorageMode = .private
         
-        self.graphRenderer.renderer.stencilTextureStorageMode = .private
-        self.graphRenderer.renderer.stencilMultisampleTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.stencilTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.stencilMultisampleTextureStorageMode = .private
+
+        self.graphRenderer.renderEncoder.albedoTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.normalTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.pbrTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.velocityTextureStorageMode = .private
+        self.graphRenderer.renderEncoder.emissiveTextureStorageMode = .private
         
         self.graphRenderer.resize(size: (Float(self.inputWidth.value ?? 1920), Float(self.inputHeight.value ?? 1080 )), scaleFactor: 1.0)
-
-    }
-    
-    override public func startExecution(context:GraphExecutionContext)
-    {
-        self.setupRenderer()
-
-        self.graphRenderer.startExecution(graph: self.subGraph, executionContext: context)
-    }
-    
-    override public func stopExecution(context:GraphExecutionContext)
-    {
-        self.graphRenderer.stopExecution(graph: self.subGraph, executionContext: context)
+        self.rendererNeedsSetup = false
     }
 
-    override public func enableExecution(context:GraphExecutionContext)
+    private func synchronizeDeferredConfiguration()
     {
-        self.graphRenderer.enableExecution(graph: self.subGraph, executionContext: context)
+        self.syncAuxiliaryOutputPorts()
+        self.rebuildGraphRenderer()
+        self.markDirty()
+    }
+
+    private func syncAuxiliaryOutputPorts()
+    {
+        for descriptor in Self.auxiliaryOutputPorts
+        {
+            if deferredMRTEnabled
+            {
+                guard self.findPort(named: descriptor.registryName, as: Port.self) == nil else { continue }
+
+                let port = NodePort<FabricImage>(
+                    name: descriptor.displayName,
+                    kind: .Outlet,
+                    description: descriptor.description
+                )
+                self.addDynamicPort(port, name: descriptor.registryName)
+            }
+            else if let port = self.findPort(named: descriptor.registryName, as: Port.self)
+            {
+                self.removePort(port)
+            }
+        }
+    }
+
+    private func rebuildGraphRenderer()
+    {
+        self.graphRenderer = self.makeGraphRenderer()
+        self.rendererNeedsSetup = true
+
+        // The inner nodes keep running across the swap; the new renderer takes over their lifecycle.
+        do { try self.graphRenderer.transitionExecution(to: self.executionState) }
+        catch { print("Graph lifecycle: \(self): \(error)") }
+    }
+
+    private func makeGraphRenderer() -> GraphRenderer
+    {
+        GraphRenderer(context: self.makeRendererContext(), graph: self.subGraph)
+    }
+
+    private func makeRendererContext() -> Context
+    {
+        guard self.deferredMRTEnabled else {
+            return self.context
+        }
+
+        return Context(
+            id:self.context.id,
+            device: self.context.device,
+            sampleCount: self.context.sampleCount,
+            colorPixelFormat: self.context.colorPixelFormat,
+            depthPixelFormat: self.context.depthPixelFormat,
+            stencilPixelFormat: self.context.stencilPixelFormat,
+            vertexAmplificationCount: self.context.vertexAmplificationCount,
+            maxBuffersInFlight: self.context.maxBuffersInFlight,
+            renderingMode: .forwardPlus,
+            activeOutputs: Self.deferredOutputs,
+            albedoPixelFormat: self.context.albedoPixelFormat,
+            normalsPixelFormat: self.context.normalsPixelFormat,
+            pbrPixelFormat: self.context.pbrPixelFormat,
+            velocityPixelFormat: self.context.velocityPixelFormat,
+            emissivePixelFormat: self.context.emissivePixelFormat,
+            gpuAllocator: self.context.gpuAllocator
+        )
+    }
+
+    /// An output something reads: connected here, or published to a parent graph. Unused secondary
+    /// outputs get no image, so nothing is allocated or copied for them.
+    private static func isUsed(_ port: Port) -> Bool
+    {
+        port.published || !port.connections.isEmpty
+    }
+
+    /// A fresh depth image the inner scene renders into directly, or nil where the encoder must keep
+    /// its own depth texture: a combined depth-stencil format (that texture is also the stencil
+    /// attachment) or deferred-geometry lighting (which reads it). Those keep the per-frame copy.
+    private func makeDirectDepthImage(width: Int, height: Int) throws -> FabricImage?
+    {
+        let encoder = self.graphRenderer.renderEncoder
+        let format = encoder.depthPixelFormat
+        guard format != .invalid, format != .depth32Float_stencil8, encoder.renderingMode != .deferredGeometry
+        else { return nil }
+        return try self.graphRenderer.makeImage(width: width, height: height, pixelFormat: format,
+                                                usage: [.renderTarget, .shaderRead])
+    }
+
+    private func sendAuxiliaryTexture(_ texture: MTLTexture?, toPortNamed portName: String,
+                                      commandBuffer: MTLCommandBuffer) throws
+    {
+        guard let port = self.findPort(named: portName, as: NodePort<FabricImage>.self) else { return }
+
+        if let texture, Self.isUsed(port)
+        {
+            port.send(try graphRenderer.newImage(copying: texture, commandBuffer: commandBuffer))
+        }
+        else
+        {
+            port.send(nil)
+        }
     }
     
-    override public func disableExecution(context:GraphExecutionContext)
+    override public func startExecution(renderer:GraphRenderer) throws
     {
-        self.graphRenderer.disableExecution(graph: self.subGraph, executionContext: context)
+        if self.rendererNeedsSetup
+        {
+            self.setupRenderer()
+        }
+
+        try super.startExecution(renderer: renderer)
     }
-    
-    override public func execute(context: GraphExecutionContext,
+
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
-                                 commandBuffer: any MTLCommandBuffer)
+                                 commandBuffer: MTLCommandBuffer) throws
     {
+        if self.rendererNeedsSetup
+        {
+            self.setupRenderer()
+        }
+
         let rpd1 = MTLRenderPassDescriptor()
     
         if self.inputWidth.valueDidChange || self.inputHeight.valueDidChange,
            let width = self.inputWidth.value,
            let height = self.inputHeight.value
         {
-            if (self.graphRenderer.renderer.size.width != Float(width))
-                || (self.graphRenderer.renderer.size.height != Float(height))
+            if (self.graphRenderer.renderEncoder.size.width != Float(width))
+                || (self.graphRenderer.renderEncoder.size.height != Float(height))
             {
                 self.graphRenderer.resize(size: (Float(width), Float(height)), scaleFactor: 1.0)
             }
         }
        
-        if self.inputClearColor.valueDidChange,
-           let clearColor = self.inputClearColor.value
-        {
-            self.graphRenderer.renderer.clearColor = .init( clearColor )
-        }
-                    
         guard let width = self.inputWidth.value,
               let height = self.inputHeight.value
         else { return }
 
             
-        if let outputImage = self.graphRenderer.newImage(withWidth: width, height: height)
+        let outputImage = try self.graphRenderer.newImage(withWidth: width, height: height)
+        rpd1.colorAttachments[0].texture = outputImage.texture
+
+        // Depth renders straight into its own output image instead of being copied each frame.
+        let depthIsUsed = Self.isUsed(self.outputDepthTexture)
+        let depthImage = depthIsUsed ? try self.makeDirectDepthImage(width: width, height: height) : nil
+        rpd1.depthAttachment.texture = depthImage?.texture
+
+        var recoverableError: (any Error)?
+        do
         {
-            rpd1.colorAttachments[0].texture = outputImage.texture
-            
-            self.graphRenderer.executeAndDraw(graph: self.subGraph,
-                                       executionContext: context,
-                                       renderPassDescriptor: rpd1,
-                                       commandBuffer: commandBuffer)
-            
-            self.outputColorTexture.send( outputImage )
+            try self.graphRenderer.executeAndDraw(executionInfo: executionInfo,
+                                                  renderPassDescriptor: rpd1,
+                                                  commandBuffer: commandBuffer)
         }
-        else
+        catch
         {
-            self.outputColorTexture.send( nil )
+            // A recoverable failure still drew the image, so it is sent before the error is rethrown.
+            guard error.isRecoverable else { throw error }
+            recoverableError = error
         }
+
+        self.outputColorTexture.send(outputImage)
         
-        if let texture = self.graphRenderer.renderer.depthTexture
+        if !depthIsUsed
         {
-            self.outputDepthTexture.send( FabricImage.unmanaged(texture: texture) )
+            self.outputDepthTexture.send(nil)
+        }
+        else if let depthImage
+        {
+            self.outputDepthTexture.send(depthImage)
+        }
+        else if let texture = self.graphRenderer.renderEncoder.depthTexture
+        {
+            self.outputDepthTexture.send(try graphRenderer.newImage(copying: texture, commandBuffer: commandBuffer))
         }
         else
         {
             self.outputDepthTexture.send( nil )
         }
+
+        if self.deferredMRTEnabled
+        {
+            try self.sendAuxiliaryTexture(self.graphRenderer.renderEncoder.albedoTexture, toPortNamed: "outputAlbedoTexture", commandBuffer: commandBuffer)
+            try self.sendAuxiliaryTexture(self.graphRenderer.renderEncoder.normalTexture, toPortNamed: "outputNormalsTexture", commandBuffer: commandBuffer)
+            try self.sendAuxiliaryTexture(self.graphRenderer.renderEncoder.pbrTexture, toPortNamed: "outputPBRTexture", commandBuffer: commandBuffer)
+            try self.sendAuxiliaryTexture(self.graphRenderer.renderEncoder.velocityTexture, toPortNamed: "outputVelocityTexture", commandBuffer: commandBuffer)
+            try self.sendAuxiliaryTexture(self.graphRenderer.renderEncoder.emissiveTexture, toPortNamed: "outputEmissiveTexture", commandBuffer: commandBuffer)
+        }
+        
+        // We need to call this to ensure any published port values also get forwarded.
+        self.forwardPortValues(force:true)
+
+        if let recoverableError
+        {
+            throw recoverableError
+        }
     }
     
     override public func resize(size: (width: Float, height: Float), scaleFactor: Float)
     {
+    }
+
+    override public func providesSettingsView() -> Bool
+    {
+        true
+    }
+
+    override public func settingsView() -> AnyView
+    {
+        performOnMainSync
+        {
+            if _settingsModelStorage == nil { _settingsModelStorage = SettingsModel(node: self) }
+            return AnyView(DeferredSubgraphNodeSettingsView(model: _settingsModelStorage!))
+        }
+    }
+
+    override public var settingsSize: SettingsViewSize
+    {
+        .Small
     }
     
 }

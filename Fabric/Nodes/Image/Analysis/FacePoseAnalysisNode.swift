@@ -74,25 +74,25 @@ public class FacePoseAnalysisNode: Node
     
     private var ciContext:CIContext!
     
-    override public func startExecution(context: GraphExecutionContext) {
-
-        if let commandQueue = context.graphRenderer?.commandQueue
-        {
-            let options = [
-                CIContextOption.cacheIntermediates : false,
-                CIContextOption.highQualityDownsample : false,
-                CIContextOption.workingFormat : CIFormat.RGBAh.rawValue,
-                CIContextOption.workingColorSpace : nil,
-                CIContextOption.outputColorSpace :nil,
-            ] as? [CIContextOption : Any]
-            
-            self.ciContext = CIContext(mtlCommandQueue: commandQueue, options: options)
-        }
+    override public func startExecution(renderer:GraphRenderer) throws
+    {
+        let options = [
+            CIContextOption.cacheIntermediates : false,
+            CIContextOption.highQualityDownsample : false,
+            CIContextOption.workingFormat : CIFormat.RGBAh.rawValue,
+            CIContextOption.workingColorSpace : nil,
+            CIContextOption.outputColorSpace :nil,
+        ] as? [CIContextOption : Any]
+        
+        self.ciContext = CIContext(mtlCommandQueue: self.context.commandQueue, options: options)
+        try super.startExecution(renderer: renderer)
     }
     
-    override public  func execute(context:GraphExecutionContext,
-                                  renderPassDescriptor: MTLRenderPassDescriptor,
-                                  commandBuffer: MTLCommandBuffer)
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputImage.valueDidChange
         {
@@ -100,17 +100,14 @@ public class FacePoseAnalysisNode: Node
             request.preferBackgroundProcessing = false
             
             
-            if let inTex = self.inputImage.value?.texture,
-               let observation =  self.faceLandmarksForRequest(request, from: inTex)
+            if let inImage = self.inputImage.value,
+               let observation = self.faceLandmarksForRequest(request, from: inImage)
             {
-                
-                let imageSize = CGSize(width: inTex.width, height: inTex.height)
-
                 if let faceContour = observation.landmarks?.faceContour
                 {
                     let points = faceContour.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputFaceContour.send( ContiguousArray(points) )
@@ -120,7 +117,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = leftEye.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputLeftEye.send( ContiguousArray(points) )
@@ -130,7 +127,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = rightEye.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputRightEye.send( ContiguousArray(points) )
@@ -140,7 +137,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = leftPupil.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputLeftPupil.send( ContiguousArray(points) )
@@ -150,7 +147,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = rightPupil.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputRightPupil.send( ContiguousArray(points) )
@@ -160,7 +157,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = leftEyebrow.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputLeftEyebrow.send( ContiguousArray(points) )
@@ -170,7 +167,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = rightEyebrow.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputRightEyebrow.send( ContiguousArray(points) )
@@ -180,7 +177,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = nose.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputNose.send( ContiguousArray(points) )
@@ -190,7 +187,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = noseCrest.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputNoseCrest.send( ContiguousArray(points) )
@@ -200,7 +197,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = medianLine.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputMedianLine.send( ContiguousArray(points) )
@@ -210,7 +207,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = innerLips.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputInnerLips.send( ContiguousArray(points) )
@@ -220,7 +217,7 @@ public class FacePoseAnalysisNode: Node
                 {
                     let points = outerLips.normalizedPoints.map {
                             
-                        return self.normalizedPointToUnits($0, imageSize: imageSize, boundingBox: observation.boundingBox)
+                        return self.normalizedPointToUnits($0, image: inImage, boundingBox: observation.boundingBox)
                     }
                     
                     self.outputOuterLips.send( ContiguousArray(points) )
@@ -268,21 +265,20 @@ public class FacePoseAnalysisNode: Node
         }
     }
     
-    private func normalizedPointToUnits(_ point:CGPoint, imageSize size:CGSize, boundingBox:CGRect) -> simd_float2
+    private func normalizedPointToUnits(_ point: CGPoint, image: FabricImage, boundingBox: CGRect) -> simd_float2
     {
+        let size = image.presentationSize
         let aspect = size.height / size.width
         
         let imagePoint = VNImagePointForFaceLandmarkPoint( simd_float2(x:Float(point.x), y:Float(point.y)), boundingBox,  Int(size.width), Int(size.height))
-        
-        let x = remap(Float(imagePoint.x), 0.0, Float(size.width), -1.0, 1.0)
-        let y = remap(Float(imagePoint.y), Float(size.height), 0.0, -Float(aspect), Float(aspect))
 
-        return simd_float2(x: x, y: y)
+        return simd_float2(remap(Float(imagePoint.x / size.width), 0.0, 1.0, -1.0, 1.0),
+                           remap(Float(imagePoint.y / size.height), 0.0, 1.0, -Float(aspect), Float(aspect)))
     }
         
-    private func faceLandmarksForRequest(_ request: VNDetectFaceLandmarksRequest, from texture:MTLTexture) ->  VNFaceObservation?
+    private func faceLandmarksForRequest(_ request: VNDetectFaceLandmarksRequest, from image: FabricImage) ->  VNFaceObservation?
     {
-        if let inputImage = CIImage(mtlTexture: texture)
+        if let inputImage = image.presentationCIImage
         {
 //            for computeDevice in MLComputeDevice.allComputeDevices
 //            {

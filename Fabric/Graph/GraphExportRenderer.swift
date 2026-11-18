@@ -1,0 +1,195 @@
+//
+//  GraphExportRenderer.swift
+//  Fabric
+//
+//  Created by Codex on 4/8/26.
+//
+
+import Foundation
+import Metal
+import Satin
+import simd
+import QuartzCore
+
+public enum GraphExportRendererError: Error {
+    case alreadyStarted
+    case sessionNotStarted
+    case commandBufferCreationFailed
+    case invalidColorTextureSize(expectedWidth: Int, expectedHeight: Int, actualWidth: Int, actualHeight: Int)
+    case invalidColorTexturePixelFormat(expected: MTLPixelFormat, actual: MTLPixelFormat)
+    case invalidDepthTextureSize(expectedWidth: Int, expectedHeight: Int, actualWidth: Int, actualHeight: Int)
+    case invalidDepthTexturePixelFormat(expected: MTLPixelFormat, actual: MTLPixelFormat)
+    case commandBufferFailed(Error?)
+}
+
+public final class GraphExportRenderer {
+    public let graph: Graph
+    public let context: Context
+    public let size: (width: Int, height: Int)
+    public let colorPixelFormat: MTLPixelFormat
+    public let depthPixelFormat: MTLPixelFormat
+    public let clearColor: simd_float4
+
+    private let graphRenderer: GraphRenderer
+    private let renderPassDescriptor = MTLRenderPassDescriptor()
+
+    private var started = false
+    /// The last frame rendered this session; the next follows it.
+    private var lastRenderedFrame: FrameTime?
+
+    public init(
+        graph: Graph,
+        context: Context,
+        size: (width: Int, height: Int),
+        colorPixelFormat: MTLPixelFormat? = nil,
+        depthPixelFormat: MTLPixelFormat? = nil,
+        clearColor: simd_float4 = .zero
+    ) {
+        self.graph = graph
+        self.context = context
+        self.size = size
+        self.colorPixelFormat = colorPixelFormat ?? context.colorPixelFormat
+        self.depthPixelFormat = depthPixelFormat ?? context.depthPixelFormat
+        self.clearColor = clearColor
+        self.graphRenderer = GraphRenderer(context: context, graph: graph)
+
+        self.renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        self.renderPassDescriptor.colorAttachments[0].storeAction = .store
+        self.renderPassDescriptor.colorAttachments[0].clearColor = .init(clearColor)
+        self.renderPassDescriptor.depthAttachment.loadAction = .clear
+        self.renderPassDescriptor.depthAttachment.storeAction = .store
+        self.renderPassDescriptor.depthAttachment.clearDepth = 1.0
+    }
+
+    public func start() throws {
+        guard !self.started else { return }
+
+        self.graphRenderer.resize(
+            size: (width: Float(self.size.width), height: Float(self.size.height)),
+            scaleFactor: 1.0
+        )
+
+        // Starting enables each node first. A failed start never reaches finish(), so disable what did start.
+        do { try self.graphRenderer.startExecution() }
+        catch
+        {
+            try? self.graphRenderer.disableExecution()
+            throw error
+        }
+
+        self.lastRenderedFrame = nil
+        self.started = true
+    }
+
+    public func renderFrame(
+        into colorTexture: MTLTexture,
+        depthTexture: MTLTexture? = nil,
+        time: TimeInterval
+    ) throws {
+        guard self.started else {
+            throw GraphExportRendererError.sessionNotStarted
+        }
+
+        try self.validateColorTexture(colorTexture)
+        try self.validateDepthTexture(depthTexture)
+
+        // Export frames are displayed at the time they render.
+        let frame = self.lastRenderedFrame?.next(time: time, displayTime: time) ?? .first(time: time, displayTime: time)
+        let executionInfo = GraphExecutionInfo(timing: frame, iterationInfo: nil, eventInfo: nil)
+
+        self.renderPassDescriptor.colorAttachments[0].texture = colorTexture
+        self.renderPassDescriptor.depthAttachment.texture = depthTexture
+        self.renderPassDescriptor.renderTargetWidth = self.size.width
+        self.renderPassDescriptor.renderTargetHeight = self.size.height
+
+        guard let commandBuffer = self.graphRenderer.makeCommandBuffer() else {
+            throw GraphExportRendererError.commandBufferCreationFailed
+        }
+        
+        try self.graphRenderer.executeAndDraw(executionInfo: executionInfo,
+                                              renderPassDescriptor: self.renderPassDescriptor,
+                                              commandBuffer: commandBuffer)
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if commandBuffer.status == .error {
+            throw GraphExportRendererError.commandBufferFailed(commandBuffer.error)
+        }
+
+        self.lastRenderedFrame = frame
+    }
+
+    public func renderSingleFrame(
+        into colorTexture: MTLTexture,
+        depthTexture: MTLTexture? = nil,
+        time: TimeInterval
+    ) throws {
+        try self.start()
+        defer { try? self.finish() }
+        try self.renderFrame(into: colorTexture, depthTexture: depthTexture, time: time)
+    }
+
+    public func finish() throws {
+        guard self.started else { return }
+
+        // Every phase runs even when an earlier one fails; the first failure is rethrown.
+        var capturedError: (any Error)?
+        do { try self.graphRenderer.stopExecution() }
+        catch { capturedError = error }
+        do { try self.graphRenderer.disableExecution() }
+        catch { if capturedError == nil { capturedError = error } }
+        self.graphRenderer.teardown()
+
+        self.renderPassDescriptor.colorAttachments[0].texture = nil
+        self.renderPassDescriptor.depthAttachment.texture = nil
+        self.renderPassDescriptor.renderTargetWidth = 0
+        self.renderPassDescriptor.renderTargetHeight = 0
+
+        self.lastRenderedFrame = nil
+        self.started = false
+
+        if let capturedError
+        {
+            throw capturedError
+        }
+    }
+
+    private func validateColorTexture(_ texture: MTLTexture) throws {
+        guard texture.width == self.size.width, texture.height == self.size.height else {
+            throw GraphExportRendererError.invalidColorTextureSize(
+                expectedWidth: self.size.width,
+                expectedHeight: self.size.height,
+                actualWidth: texture.width,
+                actualHeight: texture.height
+            )
+        }
+
+        guard texture.pixelFormat == self.colorPixelFormat else {
+            throw GraphExportRendererError.invalidColorTexturePixelFormat(
+                expected: self.colorPixelFormat,
+                actual: texture.pixelFormat
+            )
+        }
+    }
+
+    private func validateDepthTexture(_ texture: MTLTexture?) throws {
+        guard let texture else { return }
+
+        guard texture.width == self.size.width, texture.height == self.size.height else {
+            throw GraphExportRendererError.invalidDepthTextureSize(
+                expectedWidth: self.size.width,
+                expectedHeight: self.size.height,
+                actualWidth: texture.width,
+                actualHeight: texture.height
+            )
+        }
+
+        guard texture.pixelFormat == self.depthPixelFormat else {
+            throw GraphExportRendererError.invalidDepthTexturePixelFormat(
+                expected: self.depthPixelFormat,
+                actual: texture.pixelFormat
+            )
+        }
+    }
+}

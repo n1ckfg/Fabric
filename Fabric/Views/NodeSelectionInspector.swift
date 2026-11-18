@@ -7,48 +7,108 @@
 
 import SwiftUI
 import Satin
+import UniformTypeIdentifiers
 
 public struct NodeSelectionInspector: View
 {
-    let graph:Graph
-    
-    public init(graph:Graph)
-    {
-        self.graph = graph
-    }
-    
-    public var body: some View {
-        
-        let graph = self.graph.activeSubGraph ?? self.graph
-        
-        let selectedNodes = graph.nodes.filter( { $0.isSelected } )
-        
-        List {
-            
-            Section(header: Text("Published"))
-            {
-                ParameterGroupView(parameterGroup:graph.publishedParameterGroup)
-            }
-            
-            ForEach(selectedNodes, id: \.id) { node in
-            
-                Section(header: Text( node.name ) )
-                {
-                    @Bindable var bindableNode:Node = node
-                    
-                    Toggle("Node Settings", isOn: $bindableNode.showSettings)
-                        .opacity(bindableNode.providesSettingsView() ? 1.0 : 0.0)
+    let editingContext: GraphCanvasContext
 
-                    ParameterGroupView(parameterGroup: node.parameterGroup)
+    public init(editingContext: GraphCanvasContext)
+    {
+        self.editingContext = editingContext
+    }
+
+    public var body: some View {
+
+        let currentGraph = self.editingContext.currentGraph
+
+        InspectorStack
+        {
+            InspectorSection("Published")
+            {
+                ParameterGroupView(parameterGroup:currentGraph.publishedParameterGroup)
+                    // publishedParameterGroup is a plain class rebuilt in
+                    // place, invisible to observation — but every rebuild
+                    // bumps connectionRevision, so re-identify just this
+                    // view (not the whole inspector) to pick up the new params.
+                    .id(currentGraph.connectionRevision)
+            }
+
+            InspectorSectionHeading("Selected")
+
+            ForEach(currentGraph.selectedNodes) { node in
+                SelectedNodeCard(nodeViewModel: currentGraph.viewModel(for: node),
+                                 fileContentTypes: Self.fileContentTypes(for: node))
+            }
+        }
+    }
+
+    private static func fileContentTypes(for node: Node) -> [UTType]
+    {
+        if let dropTarget = type(of: node) as? any NodeFileLoadingProtocol.Type {
+            return dropTarget.supportedContentTypes
+        }
+        return [.data]
+    }
+
+}
+
+/// One inspector card per selected node. A separate view so each card
+/// observes only its own NodeViewModel — renaming one node or toggling its
+/// settings re-evaluates that card alone, not every card in the inspector.
+private struct SelectedNodeCard: View
+{
+    @Bindable var nodeViewModel: NodeViewModel
+    let fileContentTypes: [UTType]
+
+    var body: some View
+    {
+        // Read the port list unconditionally: it is the card's only observable
+        // signal that the node's parameters changed (parameterGroup is a plain
+        // class rebuilt in place), and it must fire even while the params
+        // branch below is absent. identitySignature (not plain id) so a
+        // Settings-driven type change (e.g. Switch/Gate's Type picker) also
+        // re-identifies the view — see Port.identitySignature.
+        let portSignature = nodeViewModel.ports.map(\.identitySignature)
+
+        GroupBox
+        {
+            VStack(alignment: .leading) {
+
+                label
+                    .padding(.horizontal, 5)
+
+                if nodeViewModel.providesSettingsView() {
+                    Toggle("Settings", isOn: $nodeViewModel.showSettings)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .padding(.horizontal, 5)
+                }
+
+                if nodeViewModel.parameterGroup.params.contains(where: ParameterGroupView.hasEditor) {
+
+                    Divider()
+
+                    ParameterGroupView(parameterGroup: nodeViewModel.parameterGroup,
+                                       fileContentTypes: fileContentTypes)
+                        .id(portSignature)
                 }
             }
         }
-        .listStyle(.sidebar)
-        .id(graph.shouldUpdateConnections)
-        
+    }
+
+    @ViewBuilder private var label: some View
+    {
+        if let subtitle = nodeViewModel.subtitle
+        {
+            VStack(alignment: .leading) {
+                Text(subtitle).foregroundStyle(.primary).bold()
+                Text(nodeViewModel.title).foregroundStyle(.secondary).bold()
+            }
+        }
+        else
+        {
+            Text(nodeViewModel.title).foregroundStyle(.primary).bold()
+        }
     }
 }
-
-//#Preview {
-////    NodeSelectionInspector()
-//}

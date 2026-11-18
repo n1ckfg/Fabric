@@ -12,13 +12,14 @@ import Metal
 public class IcoSphereGeometryNode : BaseGeometryNode
 {
     public override class var name:String { "IcoSphere Geometry" }
+    public override class var nodeDescription: String { "Generates icosphere geometry" }
 
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
         
         return  [
-        ("inputRadius",  ParameterPort(parameter:FloatParameter("inputRadius", 1.0, .inputfield, "Radius of the icosphere in world units"))),
-        ("inputResolution",  ParameterPort(parameter:IntParameter("inputResolution", 1, .inputfield, "Subdivision level for mesh detail (higher = more triangles)"))),
+        ("inputRadius",  ParameterPort(parameter:FloatParameter("Radius", 1.0, .inputfield, "Radius of the icosphere in world units"))),
+        ("inputResolution",  ParameterPort(parameter:IntParameter("Segments", 1, .inputfield, "Subdivision level for mesh detail (higher = more triangles)"))),
 
         ] + ports
     }
@@ -28,9 +29,9 @@ public class IcoSphereGeometryNode : BaseGeometryNode
     public var inputResolution:ParameterPort<Int> { port(named: "inputResolution")  }
 
     public override var geometry: IcoSphereGeometry { _geometry }
-    private let _geometry = IcoSphereGeometry(radius: 1.0, resolution: 1)
+    private lazy var _geometry = IcoSphereGeometry(context:self.context, radius: 1.0, resolution: 1)
     
-    override public func evaluate(geometry: SatinGeometry, atTime: TimeInterval) -> Bool
+    override public func evaluate(geometry: Geometry, atTime: TimeInterval) -> Bool
     {
         var shouldOutputGeometry = super.evaluate(geometry: geometry, atTime: atTime)
 

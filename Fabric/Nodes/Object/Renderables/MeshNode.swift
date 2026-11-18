@@ -13,6 +13,7 @@ import Metal
 public class MeshNode : BaseRenderableNode<Mesh>
 {
     override public class var name:String { "Mesh" }
+    override public class var nodeDescription: String { "Combine a Geometry and Material into a renderable Mesh, with control over shadows, face culling, and double-sided rendering." }
     override public class var nodeType:Node.NodeType { .Object(objectType: .Mesh) }
 
     // Register ports, in order of appearance
@@ -21,7 +22,7 @@ public class MeshNode : BaseRenderableNode<Mesh>
         let ports = super.registerPorts(context: context)
         
         return ports + [
-            ("inputGeometry",  NodePort<SatinGeometry>(name: "Geometry", kind: .Inlet, description: "Geometry mesh to render")),
+            ("inputGeometry",  NodePort<Geometry>(name: "Geometry", kind: .Inlet, description: "Geometry mesh to render")),
             ("inputMaterial",  NodePort<Material>(name: "Material", kind: .Inlet, description: "Material to apply to the geometry")),
             ("inputCastsShadow",  ParameterPort(parameter: BoolParameter("Enable Shadows", true, .button, "When enabled, the mesh casts and receives shadows") ) ),
             ("inputDoubleSided",  ParameterPort(parameter: BoolParameter("Double Sided", false, .button, "When enabled, renders both front and back faces") ) ),
@@ -30,7 +31,7 @@ public class MeshNode : BaseRenderableNode<Mesh>
     }
         
     // Ergonomic access (no storage assignment needed)
-    public var inputGeometry: NodePort<SatinGeometry>   { port(named: "inputGeometry") }
+    public var inputGeometry: NodePort<Geometry>   { port(named: "inputGeometry") }
     public var inputMaterial: NodePort<Material>   { port(named: "inputMaterial") }
     public var inputCastsShadow: ParameterPort<Bool>   { port(named: "inputCastsShadow") }
     public var inputDoubleSided: ParameterPort<Bool>   { port(named: "inputDoubleSided") }
@@ -60,10 +61,9 @@ public class MeshNode : BaseRenderableNode<Mesh>
     
     override public func teardown()
     {
-        super.teardown()
         self.mesh = nil
-        self.inputGeometry.value = nil
-        self.inputMaterial.value = nil
+
+        super.teardown()
     }
     
     override public func evaluate(object: Object?, atTime: TimeInterval) -> Bool
@@ -99,9 +99,11 @@ public class MeshNode : BaseRenderableNode<Mesh>
     }
     
     
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if
             (self.inputGeometry.valueDidChange
@@ -129,14 +131,12 @@ public class MeshNode : BaseRenderableNode<Mesh>
                         mesh.material = material
                     }
 
-                    self.applyCurrentMeshState(mesh,
-                                               materialJustAttached: materialJustAttached)
+                    self.applyCurrentMeshState(mesh)
                 }
                 else
                 {
-                    let mesh = Mesh(geometry: geometry, material: material)
-                    self.applyCurrentMeshState(mesh,
-                                               materialJustAttached: true)
+                    let mesh = Mesh(context:self.context, geometry: geometry, material: material)
+                    self.applyCurrentMeshState(mesh)
 
                     self.mesh = mesh
                 }
@@ -149,17 +149,16 @@ public class MeshNode : BaseRenderableNode<Mesh>
          
         if let mesh = mesh
         {
-            let _ = self.evaluate(object: mesh, atTime: context.timing.time)
+            let _ = self.evaluate(object: mesh, atTime: executionInfo.timing.time)
         }
      }
 
-    private func applyCurrentMeshState(_ mesh: Mesh,
-                                       materialJustAttached: Bool)
+    private func applyCurrentMeshState(_ mesh: Mesh)
     {
         mesh.lookAt(target: simd_float3(repeating: 0))
         mesh.visible = self.inputVisible.value ?? true
         mesh.renderOrder = self.inputRenderOrder.value ?? 0
-        mesh.renderPass = self.inputRenderPass.value ?? 0
+
         mesh.position = self.inputPosition.value ?? .zero
         mesh.scale = self.inputScale.value ?? simd_float3(repeating: 1)
 
@@ -172,12 +171,6 @@ public class MeshNode : BaseRenderableNode<Mesh>
         mesh.cullMode = self.cullMode()
         mesh.doubleSided = self.inputDoubleSided.value ?? false
 
-        if materialJustAttached,
-           let material = mesh.material
-        {
-            material.castShadow = castShadow
-            material.receiveShadow = castShadow
-        }
     }
     
     func cullMode() -> MTLCullMode

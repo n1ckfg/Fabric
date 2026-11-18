@@ -12,11 +12,11 @@ import Metal
 
 public class TransposeTransformNode : Node
 {
-    override public class var name:String { "Transpose A Transform" }
+    override public class var name:String { "Transform Transpose" }
     override public class var nodeType:Node.NodeType { .Parameter(parameterType: .Transform) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
     override public class var nodeTimeMode: Node.TimeMode { .None }
-    override public class var nodeDescription: String { "Transpose a Transform"}
+    override public class var nodeDescription: String { "Transpose a transform"}
     
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -24,7 +24,7 @@ public class TransposeTransformNode : Node
         
         return ports +
         [
-            ("inputTransform", NodePort<simd_float4x4>(name: "Transform" , kind: .Inlet, description: "4x4 transform matrix to transpose")),
+            ("inputTransform", PortType.Transform.makeFreshPort(name: "Transform", kind: .Inlet, description: "4x4 transform matrix to transpose")),
             ("outputTransform", NodePort<simd_float4x4>(name: "Transform" , kind: .Outlet, description: "Transposed 4x4 transform matrix")),
         ]
     }
@@ -34,9 +34,11 @@ public class TransposeTransformNode : Node
     public var inputTranslation:NodePort<simd_float3> { port(named: "inputTranslation") }
     public var outputTransform:NodePort<simd_float4x4> { port(named: "outputTransform") }
     
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputTranslation.valueDidChange || self.inputTransform.valueDidChange,
            let inputTransform = self.inputTransform.value

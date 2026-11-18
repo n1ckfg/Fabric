@@ -8,19 +8,20 @@
 import Satin
 import Metal
 import simd
+import UniformTypeIdentifiers
 
 public class BaseTextureComputeProcessorNode: Node, NodeFileLoadingProtocol
 {
+    public static var supportedContentTypes: [UTType] { [] }
+    
     override public class var name: String { "Base Texture Compute" }
     override public class var nodeType: Node.NodeType { .Image(imageType: .BaseEffect) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
     override public class var nodeTimeMode: Node.TimeMode { .None }
+    override public class var nodeDescription: String { "Compute-based image processing effect" }
     
-    override public var name: String {
-        guard let fileURL = self.url else {
-            return BaseTextureComputeProcessorNode.name
-        }
-        
+    override public func deriveSubtitle() -> String? {
+        guard let fileURL = self.url else { return nil }
         return self.fileURLToName(fileURL: fileURL)
     }
     
@@ -43,6 +44,11 @@ public class BaseTextureComputeProcessorNode: Node, NodeFileLoadingProtocol
     public var outputImage:NodePort<FabricImage> { port(named: "outputImage") }
     private var url:URL? = nil
 
+    private enum CodingKeys: String, CodingKey
+    {
+        case effectPath
+    }
+
     // MARK: - Init
     required public init(context: Context, fileURL: URL) throws
     {
@@ -51,16 +57,55 @@ public class BaseTextureComputeProcessorNode: Node, NodeFileLoadingProtocol
         super.init(context: context)
         setupProcessor(context: context)
     }
-    
+
     public required init(context: Context)
     {
         fatalError("init(from:) has not been implemented")
     }
-    
+
     public required init(from decoder: any Decoder) throws
     {
         try super.init(from: decoder)
+
+        // The processor and any uniform ports it declares can only come from
+        // the shader file, so rebuild from the restored bundle-relative path;
+        // rebuilt ports adopt persisted identity and state by registry key as
+        // they register.
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let path = try container.decodeIfPresent(String.self, forKey: .effectPath),
+           let shaderURL = Self.resolveBundleResource(path: path)
+        {
+            // Hold the binding even when the bundle no longer provides the
+            // file: encode derives effectPath from it, so leaving it nil would
+            // quietly erase the document's shader choice at the next save.
+            self.url = shaderURL
+            self.pipelineURL = shaderURL
+
+            // A file that is not there leaves compute nil, which execute
+            // already reports as unavailable.
+            if FileManager.default.fileExists(atPath: shaderURL.path(percentEncoded: false))
+            {
+                self.setupProcessor(context: self.context)
+            }
+        }
     }
+
+    override public func encode(to encoder: Encoder) throws
+    {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        if let url = self.url
+        {
+            try container.encodeIfPresent(Self.bundleRelativeResourcePath(for: url), forKey: .effectPath)
+        }
+
+        try super.encode(to: encoder)
+    }
+
+    public func setFileURL(_ url: URL) {
+        // no op
+    }
+    
     
     private func setupProcessor(context: Context)
     {
@@ -72,32 +117,46 @@ public class BaseTextureComputeProcessorNode: Node, NodeFileLoadingProtocol
 //        
         for param in self.compute.parameters.params {
 
-            if let p = PortType.portForType(from:param)
+            if let port = PortType.port(for: param)
             {
-                self.addDynamicPort(p)
+                self.addDynamicPort(port)
             }
         }
     }
 
     // MARK: - Execution
-    override public func execute(context: GraphExecutionContext,
-                                 renderPassDescriptor: MTLRenderPassDescriptor,
-                                 commandBuffer: MTLCommandBuffer)
+    public override func execute(renderer:GraphRenderer, executionInfo:GraphExecutionInfo, renderPassDescriptor: MTLRenderPassDescriptor, commandBuffer: MTLCommandBuffer) throws
     {
         guard self.inputImage.valueDidChange,
-              let inTex = self.inputImage.value?.texture,
-              let outImage = context.graphRenderer?.newImage(withWidth: inTex.width, height: inTex.height),
-              let computeEncoder = commandBuffer.makeComputeCommandEncoder()
-                
+              let inputImage = self.inputImage.value
         else { return }
+        let inTex = inputImage.texture
+
+        guard self.compute != nil else
+        {
+            throw FabricError(.execution(.gpu),
+                              severity: .recoverable,
+                              message: "\(self) compute processor is unavailable")
+        }
+
+        let outImage = try renderer.newImage(withWidth: inTex.width, height: inTex.height)
+        outImage.textureTransform = inputImage.textureTransform
+
+        guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else
+        {
+            throw FabricError(.execution(.gpu),
+                              severity: .recoverable,
+                              message: "Could not create \(self) compute encoder")
+        }
         
         // Input Texture to Compute
         self.compute.set(inTex, index: .Custom0)
         self.compute.set(outImage.texture, index: .Custom1)
     
-        self.compute.update(computeEncoder)
-        
-        computeEncoder.endEncoding()
+        do {
+            defer { computeEncoder.endEncoding() }
+            try self.compute.update(computeEncoder)
+        }
         
         self.outputImage.send(outImage)
     }

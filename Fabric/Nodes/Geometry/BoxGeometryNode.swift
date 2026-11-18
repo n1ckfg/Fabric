@@ -12,6 +12,7 @@ import Metal
 public class BoxGeometryNode : BaseGeometryNode
 {
     public override class var name:String { "Box Geometry" }
+    public override class var nodeDescription: String { "Generates box geometry" }
 
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
@@ -31,10 +32,10 @@ public class BoxGeometryNode : BaseGeometryNode
     
     public override var geometry: BoxGeometry { _geometry }
     
-    private let _geometry = BoxGeometry(width: 1, height: 1, depth: 1)
+    private lazy var _geometry = BoxGeometry(context:self.context, width: 1, height: 1, depth: 1)
 
     
-    override public func evaluate(geometry: SatinGeometry, atTime: TimeInterval) -> Bool
+    override public func evaluate(geometry: Geometry, atTime: TimeInterval) -> Bool
     {
         var shouldOutputGeometry = super.evaluate(geometry: geometry, atTime: atTime)
         
@@ -60,10 +61,10 @@ public class BoxGeometryNode : BaseGeometryNode
         }
         
         // TODO: Fix
-        if self.inputResolutionParam.valueDidChange
-//           let resolution = self.inputResolutionParam.value
+        if self.inputResolutionParam.valueDidChange,
+           let resolution = self.inputResolutionParam.value
         {
-//            self.geometry.resolution =  self.inputResolutionParam.value
+            self.geometry.resolution = simd_int3(resolution)
             shouldOutputGeometry = true
         }
         

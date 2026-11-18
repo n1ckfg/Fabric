@@ -27,7 +27,7 @@ public class NumberBinaryOperator : Node
             ("inputNumber1", ParameterPort(parameter: FloatParameter("Number A", 0.0, .inputfield, "First operand for the binary operation"))),
             ("inputNumber2", ParameterPort(parameter: FloatParameter("Number B", 0.0, .inputfield, "Second operand for the binary operation"))),
             ("inputParam", ParameterPort(parameter: StringParameter("Operator", "Add", BinaryMathOperator.allCases.map(\.rawValue), .dropdown, "Mathematical operation to perform")) ),
-            ("outputNumber", NodePort<Float>(name: NumberNode.name , kind: .Outlet, description: "Result of the binary operation")),
+            ("outputNumber", NodePort<Float>(name: "Number" , kind: .Outlet, description: "Result of the binary operation")),
         ]
     }
     
@@ -39,18 +39,20 @@ public class NumberBinaryOperator : Node
     
     private var mathOperator = BinaryMathOperator.Add
     
-    override public func startExecution(context: GraphExecutionContext) {
-        super.startExecution(context: context)
-        
+    override public func startExecution(renderer:GraphRenderer) throws
+    {
         if let stringParam = self.inputParam.parameter as? StringParameter
         {
             stringParam.options = BinaryMathOperator.allCases.map(\.rawValue)
         }
+        try super.startExecution(renderer: renderer)
     }
          
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputParam.valueDidChange,
            let param = self.inputParam.value,

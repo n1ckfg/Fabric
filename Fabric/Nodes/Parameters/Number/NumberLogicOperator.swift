@@ -39,18 +39,20 @@ public class NumberLogicOperator : Node
     
     private var mathOperator = BinaryMathLogicOperator.Equals
     
-    override public func startExecution(context: GraphExecutionContext) {
-        super.startExecution(context: context)
-        
+    override public func startExecution(renderer:GraphRenderer) throws
+    {
         if let stringParam = self.inputParam.parameter as? StringParameter
         {
             stringParam.options = BinaryMathLogicOperator.allCases.map(\.rawValue)
         }
+        try super.startExecution(renderer: renderer)
     }
          
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputParam.valueDidChange,
            let param = self.inputParam.value,

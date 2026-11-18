@@ -4,376 +4,194 @@
 //
 //  Created by Anton Marini on 4/26/25.
 //
-import simd
+
 import Foundation
+import Satin
+import UniformTypeIdentifiers
 
-public class NodeRegistry {
-    
-    public static let shared = NodeRegistry()
-    
-    
-    public func nodeClass(for nodeName: String) -> (Node.Type)? {
-        return self.nodesClassLookup[nodeName]
-    }
-    
-    public lazy private(set) var availableNodes:[NodeClassWrapper] = {
-        self.nodesClasses.map( { NodeClassWrapper(nodeClass: $0) } ) + self.dynamicEffectNodes
-    }()
+public class NodeRegistry
+{
+    private static let sharedResult = Result { try NodeRegistry() }
 
-    private lazy var nodesClassLookup: [String: Node.Type] =  {
-        self.nodesClasses.reduce(into: [:]) { result, nodeClass in
-            result[String(describing: nodeClass)] = nodeClass
-        }
-    }()
-    
-    private var nodesClasses: [Node.Type] {
-        self.cameraNodeClasses
-        + self.lightNodeClasses
-        + self.objectNodeClasses
-        + self.geometryNodeClasses
-        + self.materialNodeClasses
-        + self.textureNodeClasses
-        + self.parameterNodeClasses
-        + self.ioNodeClasses
-        + self.macroNodeClasses
-        + self.utilityClasses
-    }
-    
-    private var cameraNodeClasses: [Node.Type] = [
-         PerspectiveCameraNode.self,
-         OrthographicCameraNode.self,
-    ]
-    
-    private var lightNodeClasses: [Node.Type] = [
-        DirectionalLightNode.self,
-        PointLightNode.self,
-    ]
-    
-    private var objectNodeClasses: [Node.Type] = [
-        // Objects / Rendering
-        MeshNode.self,
-        ModelMeshNode.self,
-        InstancedMeshNode.self,
-        InstancedModelMeshNode.self,
-        EnvironmentSkyboxNode.self,
-        BillboardNode.self,
-    ]
-    
-    private var geometryNodeClasses: [Node.Type] = [ // Geometry
-        PlaneGeometryNode.self,
-        PerspectiveQuadGeometryNode.self,
-        RoundRectGeometryNode.self,
-        TriangleGeometryNode.self,
-        CircleGeometryNode.self,
-        ArcGeometryNode.self,
-        ConeGeometryNode.self,
-        BoxGeometryNode.self,
-        RoundBoxGeometryNode.self,
-        SphereGeometryNode.self,
-        IcoSphereGeometryNode.self,
-        CapsuleGeometryNode.self,
-        TubeGeometryNode.self,
-        TorusGeometryNode.self,
-//        SkyboxGeometryNode.self,
-        TesselatedTextGeometryNode.self,
-        ExtrudedTextGeometryNode.self,
-        PixelArrayToGeometryNode.self,
-        SuperShapeGeometryNode.self,
-    ]
-        
-    private var materialNodeClasses:[Node.Type] = [
-        // Materials
-        BasicColorMaterialNode.self,
-        UVMaterialNode.self,
-        BasicTextureMaterialNode.self,
-        BasicDiffuseMaterialNode.self,
-//        SkyboxMaterialNode.self,
-        DepthMaterialNode.self,
-        //ShadowMaterialNode.self,
-        StandardMaterialNode.self,
-        PBRMaterialNode.self,
-        DisplacementMaterialNode.self,
-    ]
-    
-    private var textureNodeClasses:[Node.Type] {
-        var classes: [Node.Type] = [
-            MovieProviderNode.self,
-            CameraProviderNode.self,
-            ImageProviderNode.self,
-            TestCardProviderNode.self,
-        ]
-        #if os(macOS)
-        classes.append(ScreenCaptureProviderNode.self)
-        #endif
-        #if FABRIC_SYPHON_ENABLED
-        classes.append(contentsOf: [
-            SyphonClientNode.self,
-            SyphonServerNode.self,
-        ])
-        #endif
-        classes.append(contentsOf: [
-            GaussianBlurNode.self,
-            MotionBlurNode.self,
-            ZoomBlurNode.self,
-            ForegroundMaskNode.self,
-            PersonSegmentationMaskNode.self,
-            FacePoseAnalysisNode.self,
-            HandPoseAnalysisNode.self,
-            LocalVLMNode.self,
-            ContourPathNode.self,
-            MetalFXSpatialUpsample2xNode.self,
-            KeypointDistortNode.self,
-            LUTProcessorNode.self,
-
-            ArrayIndexValueNode<FabricImage>.self,
-            ArrayCountNode<FabricImage>.self,
-            ArrayQueueNode<FabricImage>.self,
-            ArrayReplaceValueAtIndexNode<FabricImage>.self,
-        ])
-        return classes
-    }
-
-    // Sub Patch Iterator, Replicate etc
-    private var macroNodeClasses:[Node.Type] = [
-        SubgraphNode.self,
-        DeferredSubgraphNode.self,
-        IteratorNode.self,
-        IteratorInfoNode.self,
-        EnvironmentNode.self,
-    ]
-    
-    private var dynamicEffectNodes:[NodeClassWrapper]
+    public static var shared: NodeRegistry
     {
-        let bundle = Bundle.module
-
-        var nodes:[NodeClassWrapper] = []
-
-        for imageEffectType in Node.NodeType.ImageType.allCases
+        get throws
         {
-            let singleChannelEffects = "Effects/\(imageEffectType.rawValue)"
-            let twoChannelEffects = "EffectsTwoChannel/\(imageEffectType.rawValue)"
-            let threeChannelEffects = "EffectsThreeChannel/\(imageEffectType.rawValue)"
-            
-            let computeSubdir = "Compute/\(imageEffectType.rawValue)"
-            
-            if
-               let singleChannelEffects = bundle.urls(forResourcesWithExtension: "metal", subdirectory:singleChannelEffects),
-               let twoChannelEffects = bundle.urls(forResourcesWithExtension: "metal", subdirectory:twoChannelEffects),
-               let threeChannelEffects = bundle.urls(forResourcesWithExtension: "metal", subdirectory:threeChannelEffects),
-               let singleChannelComputeEffects = bundle.urls(forResourcesWithExtension: "metal", subdirectory:computeSubdir)
-            {
-                for fileURL in singleChannelEffects
-                {
-                    let baseClass = [.Generator, .ShapeGenerator].contains(imageEffectType) ? BaseGeneratorNode.self : BaseEffectNode.self
-                    let node = NodeClassWrapper(nodeClass: baseClass,
-                                                nodeType: .Image(imageType: imageEffectType),
-                                                fileURL: fileURL,
-                                                nodeName:self.fileURLToName(fileURL: fileURL))
-                    nodes.append( node )
-                }
-                
-                for fileURL in twoChannelEffects
-                {
-                    let node = NodeClassWrapper(nodeClass: BaseEffectTwoChannelNode.self,
-                                                nodeType: .Image(imageType: imageEffectType),
-                                                fileURL: fileURL,
-                                                nodeName:self.fileURLToName(fileURL: fileURL))
-                    nodes.append( node )
-                }
+            try sharedResult.get()
+        }
+    }
 
-                for fileURL in threeChannelEffects
+    /// The node lists are what the plugins registered, which is settled by the
+    /// time the plugins have loaded: computed once here, read as plain arrays.
+    init() throws
+    {
+        try PluginLoader.shared.loadAllPlugins()
+
+        let availableNodes = PluginLoader.shared.pluginNodeWrappers
+        self.availableNodes = availableNodes
+        self.subgraphNodes = availableNodes.filter { $0.subgraphClass != nil }
+        self.allSupportedDropTypes = Self.nodeFileLoadingClasses.flatMap { $0.supportedContentTypes }
+    }
+
+    public func nodeClass(pluginID: String, nodeID: String) -> (Node.Type)?
+    {
+        if let legacyClass = self.legacyNodeClassLookup[PluginQualifiedNodeID(pluginID: pluginID, nodeID: nodeID)]
+        {
+            return legacyClass
+        }
+
+        return PluginLoader.shared.nodeClass(pluginID: pluginID, nodeID: nodeID)
+    }
+
+    /// Prefer the most specific supported type. Registration order breaks ties,
+    /// so a broad type cannot steal a drop from a more specific file loader.
+    public func dropTargetNodeClass(for contentType: UTType) -> (any NodeFileLoadingProtocol.Type)?
+    {
+        var selectedNodeClass: (any NodeFileLoadingProtocol.Type)?
+        var selectedContentType: UTType?
+
+        for dropNodeClass in Self.nodeFileLoadingClasses
+        {
+            for supportedType in dropNodeClass.supportedContentTypes where contentType.conforms(to: supportedType)
+            {
+                if let selectedContentType,
+                   !supportedType.conforms(to: selectedContentType) || supportedType == selectedContentType
                 {
-                    let node = NodeClassWrapper(nodeClass: BaseEffectThreeChannelNode.self,
-                                                nodeType: .Image(imageType: imageEffectType),
-                                                fileURL: fileURL,
-                                                nodeName:self.fileURLToName(fileURL: fileURL))
-                    nodes.append( node )
+                    continue
                 }
-                
-                for fileURL in singleChannelComputeEffects
-                {
-                    let node = NodeClassWrapper(nodeClass: BaseTextureComputeProcessorNode.self,
-                                                nodeType: .Image(imageType: imageEffectType),
-                                                fileURL: fileURL,
-                                                nodeName:self.fileURLToName(fileURL: fileURL))
-                    nodes.append( node )
-                }
+                selectedNodeClass = dropNodeClass
+                selectedContentType = supportedType
             }
         }
-        
-        // Not quite a localizedStandardCompare but whatever
-        nodes.sort { a, b in
-            
-            return a.nodeName < b.nodeName
+
+        return selectedNodeClass
+    }
+
+    /// All UTTypes accepted by drop-target nodes, for use with drop destination handlers.
+    public let allSupportedDropTypes: [UTType]
+
+    /// Every registered node.
+    public let availableNodes: [NodeClassWrapper]
+
+    /// The registered node classes that are a kind of subgraph, in
+    /// registration order: the core kinds and any a plugin adds. For choices
+    /// such as Embed Selection In.
+    public let subgraphNodes: [NodeClassWrapper]
+
+    public var pluginLoadErrors: [PluginLoadError]
+    {
+        return PluginLoader.shared.loadErrors
+    }
+
+    private static var nodeFileLoadingClasses: [(any NodeFileLoadingProtocol.Type)]
+    {
+        PluginLoader.shared.pluginNodeWrappers.compactMap { wrapper in
+            wrapper.nodeClass as? any NodeFileLoadingProtocol.Type
         }
-        return nodes
-    }
-    
-    private func fileURLToName(fileURL:URL) -> String {
-        let nodeName =  fileURL.deletingPathExtension().lastPathComponent.replacing("ImageNode", with: "")
-
-        return nodeName.titleCase
-    }
-    
-    private var parameterNodeClasses: [Node.Type] = [
-        // Boolean
-        TrueNode.self,
-        FalseNode.self,
-        BooleanLogicNode.self,
-        ArrayFirstValueNode<Bool>.self,
-        ArrayLastValueNode<Bool>.self,
-        ArrayIndexValueNode<Bool>.self,
-        ArrayCountNode<Bool>.self,
-        ArrayQueueNode<Bool>.self,
-        ArrayReplaceValueAtIndexNode<Bool>.self,
-
-        // Number
-        CurrentTimeNode.self,
-        SystemTimeNode.self,
-        NumberNode.self,
-        TimelineNode.self,
-        NumberUnaryOperator.self,
-        NumberBinaryOperator.self,
-        NumberLogicOperator.self,
-        NumberRoundNode.self,
-        NumberClampNode.self,
-        NumberEaseNode.self,
-        NumberRemapNode.self,
-        NumberIntegralNode.self,
-        NumberSmoothNode.self,
-        MathExpressionNode.self,
-        GradientNoiseNode.self,
-        AudioSpectrumNode.self,
-        ArrayFirstValueNode<Float>.self,
-        ArrayLastValueNode<Float>.self,
-        ArrayIndexValueNode<Float>.self,
-        ArrayCountNode<Float>.self,
-        ArrayQueueNode<Float>.self,
-        ArrayReplaceValueAtIndexNode<Float>.self,
-        FloatArrayToVector2ArrayNode.self,
-        FloatArrayToVector3ArrayNode.self,
-        Vector2ArrayToVector3ArrayNode.self,
-        Vector3ArrayToTransformArrayNode.self,
-        
-        // String
-        StringNode.self,
-        TextFileLoaderNode.self,
-        StringJoinNode.self,
-        StringComponentNode.self,
-        StringLengthNode.self,
-        StringRangeNode.self,
-        StringWrapNode.self,
-        StringRemoveWhitespaceNode.self,
-        StringDifferenceNode.self,
-//        ConvertToStringNode.self,
-        LocalLLMNode.self,
-        ArrayFirstValueNode<String>.self,
-        ArrayLastValueNode<String>.self,
-        ArrayIndexValueNode<String>.self,
-        ArrayCountNode<String>.self,
-        ArrayQueueNode<String>.self,
-        ArrayReplaceValueAtIndexNode<String>.self,
-
-        // Vectors
-        MakeVector2Node.self,
-        Vector2ToFloatNode.self,
-        Vector2Distance.self,
-        ArrayFirstValueNode<simd_float2>.self,
-        ArrayLastValueNode<simd_float2>.self,
-        ArrayIndexValueNode<simd_float2>.self,
-        ArrayCountNode<simd_float2>.self,
-        ArrayQueueNode<simd_float2>.self,
-        ArrayReplaceValueAtIndexNode<simd_float2>.self,
-        PolyLineSimplifyNode.self,
-        
-        MakeVector3Node.self,
-        Vector3ToFloatNode.self,
-        Vector3Distance.self,
-        ArrayFirstValueNode<simd_float3>.self,
-        ArrayLastValueNode<simd_float3>.self,
-        ArrayIndexValueNode<simd_float3>.self,
-        ArrayCountNode<simd_float3>.self,
-        ArrayQueueNode<simd_float3>.self,
-        ArrayReplaceValueAtIndexNode<simd_float3>.self,
-
-        MakeVector4Node.self,
-        Vector4ToFloatNode.self,
-        Vector4Distance.self,
-        ArrayFirstValueNode<simd_float4>.self,
-        ArrayLastValueNode<simd_float4>.self,
-        ArrayIndexValueNode<simd_float4>.self,
-        ArrayCountNode<simd_float4>.self,
-        ArrayQueueNode<simd_float4>.self,
-        ArrayReplaceValueAtIndexNode<simd_float4>.self,
-
-        // Quaternion
-        MakeQuaternionNode.self,
-        
-        // Transform (Float Matrix 4x4)
-        IdentityTransformNode.self,
-        RotateTransformNode.self,
-        ScaleTransformNode.self,
-        TranslateTransformNode.self,
-        TransposeTransformNode.self,
-        InvertTransformNode.self,
-        DecomposeTransformNode.self,
-        GeometryToTransformArrayNode.self,
-        ArrayFirstValueNode<simd_float4x4>.self,
-        ArrayLastValueNode<simd_float4x4>.self,
-        ArrayIndexValueNode<simd_float4x4>.self,
-        ArrayCountNode<simd_float4x4>.self,
-        ArrayQueueNode<simd_float4x4>.self,
-        ArrayReplaceValueAtIndexNode<simd_float4x4>.self,
-
-        ]
-    
-    private var ioNodeClasses: [Node.Type] {
-        var classes: [Node.Type] = [
-            OSCReceiveNode.self,
-        ]
-        #if os(macOS)
-        classes.append(HIDNode.self)
-        #endif
-        classes.append(contentsOf: [
-            GameControllerNode.self,
-            MIDIInputNode.self,
-        ])
-        return classes
     }
 
-    private var utilityClasses: [Node.Type] {
-        var classes: [Node.Type] = [
-            LogNode.self,
-            CursorNode.self,
+    public func qualifiedNodeID(for nodeClass: Node.Type) -> PluginQualifiedNodeID?
+    {
+        PluginLoader.shared.qualifiedNodeID(for: nodeClass)
+    }
+
+    public func validatePluginRequirements(_ requirements: [PluginRequirement]) throws
+    {
+        for requirement in requirements
+        {
+            guard let pluginInfo = PluginLoader.shared.loadedPlugins[requirement.id] else
+            {
+                throw FabricError(.loading(.pluginNotFound),
+                                  severity: .fatal,
+                                  message: "Required plugin '\(requirement.id)' is not loaded")
+            }
+
+            guard Self.version(pluginInfo.version, isAtLeast: requirement.version) else
+            {
+                throw FabricError(.loading(.pluginLoadFailed),
+                                  severity: .fatal,
+                                  message: "Required plugin '\(requirement.id)' needs version \(requirement.version ?? ""), but loaded version is \(pluginInfo.version ?? "unknown")")
+            }
+        }
+    }
+
+    private lazy var legacyNodeClassLookup: [PluginQualifiedNodeID: Node.Type] = {
+        var result: [PluginQualifiedNodeID: Node.Type] = [:]
+
+        func registerCoreAlias(_ nodeID: String, _ nodeClass: Node.Type)
+        {
+            result[PluginQualifiedNodeID(pluginID: PluginLoader.coreNodesPluginID, nodeID: nodeID)] = nodeClass
+        }
+
+        // Legacy class-name aliases: old saved graphs used SatinGeometry in generic type params.
+        // Both module-qualified and bare forms are covered since Swift's output can vary.
+        registerCoreAlias("PassThroughNode<SatinGeometry>", PassThroughNode<Geometry>.self)
+        registerCoreAlias("PassThroughNode<Satin.SatinGeometry>", PassThroughNode<Geometry>.self)
+
+        // Structural array nodes were previously generic; old docs decode to type-agnostic versions.
+        //
+        // These suffixes must be spelled the way a *document* spells them, which is
+        // `String(describing:)` of the generic parameter — and that prints the
+        // underlying type, not the source alias. `simd_float2/3/4` are typealiases
+        // for `SIMD2/3/4<Float>`, so a saved graph reads `ArrayCountNode<SIMD3<Float>>`
+        // and never `ArrayCountNode<simd_float3>`. `simd_float4x4` is a struct in its
+        // own right, so it is spelled as written.
+        let agnosticSuffixes = [
+            "Bool",
+            "Int",
+            "Float",
+            "String",
+            "SIMD2<Float>",
+            "SIMD3<Float>",
+            "SIMD4<Float>",
+            "simd_float4x4",
+            "FabricImage",
         ]
-        #if os(macOS)
-        classes.append(KeyboardNode.self)
-        #endif
-        classes.append(contentsOf: [
-            RenderInfoNode.self,
-            ImageDimensions.self,
-            PixelsToUnitsNode.self,
-            UnitsoPixelsNode.self,
 
-            SignalNode.self,
+        for suffix in agnosticSuffixes
+        {
+            registerCoreAlias("ArrayQueueNode<\(suffix)>", ArrayQueueNode.self)
+            registerCoreAlias("ArrayFirstValueNode<\(suffix)>", ArrayFirstValueNode.self)
+            registerCoreAlias("ArrayLastValueNode<\(suffix)>", ArrayLastValueNode.self)
+            registerCoreAlias("ArrayIndexValueNode<\(suffix)>", ArrayIndexValueNode.self)
+            registerCoreAlias("ArrayCountNode<\(suffix)>", ArrayCountNode.self)
+            registerCoreAlias("ArrayAppendNode<\(suffix)>", ArrayAppendNode.self)
+            registerCoreAlias("ArrayReplaceValueAtIndexNode<\(suffix)>", ArrayReplaceValueAtIndexNode.self)
+            registerCoreAlias("ArraySplitAtIndexNode<\(suffix)>", ArraySplitAtIndexNode.self)
+        }
 
-            SampleAndHoldNode<Bool>.self,
-            SampleAndHoldNode<Float>.self,
-            SampleAndHoldNode<simd_float2>.self,
-            SampleAndHoldNode<simd_float3>.self,
-            SampleAndHoldNode<simd_float4>.self,
-            SampleAndHoldNode<String>.self,
-            SampleAndHoldNode<simd_quatf>.self,
-            SampleAndHoldNode<simd_float4x4>.self,
-            SampleAndHoldNode<FabricImage>.self,
+        // Vector compose/decompose nodes were previously generic; old docs map to consolidated versions.
+        let vectorSuffixes = ["SIMD2<Float>", "SIMD3<Float>", "SIMD4<Float>"]
 
-            SampleAndHoldNode<ContiguousArray<Bool>>.self,
-            SampleAndHoldNode<ContiguousArray<Float>>.self,
-            SampleAndHoldNode<ContiguousArray<simd_float2>>.self,
-            SampleAndHoldNode<ContiguousArray<simd_float3>>.self,
-            SampleAndHoldNode<ContiguousArray<simd_float4>>.self,
-            SampleAndHoldNode<ContiguousArray<String>>.self,
-        ])
-        return classes
+        for suffix in vectorSuffixes
+        {
+            registerCoreAlias("ComposeVectorNode<\(suffix)>", ComposeVectorNode.self)
+            registerCoreAlias("DecomposeVectorNode<\(suffix)>", DecomposeVectorNode.self)
+            registerCoreAlias("ComposeVectorArrayNode<\(suffix)>", ComposeVectorArrayNode.self)
+            registerCoreAlias("DecomposeVectorArrayNode<\(suffix)>", DecomposeVectorArrayNode.self)
+        }
+
+        return result
+    }()
+
+    private static func version(_ loadedVersion: String?, isAtLeast requiredVersion: String?) -> Bool
+    {
+        guard let requiredVersion else { return true }
+        guard let loadedVersion else { return false }
+
+        let loadedComponents = loadedVersion.split(separator: ".").map { Int(String($0)) ?? 0 }
+        let requiredComponents = requiredVersion.split(separator: ".").map { Int(String($0)) ?? 0 }
+        let count = max(loadedComponents.count, requiredComponents.count)
+
+        for index in 0..<count
+        {
+            let loaded = index < loadedComponents.count ? loadedComponents[index] : 0
+            let required = index < requiredComponents.count ? requiredComponents[index] : 0
+
+            if loaded > required { return true }
+            if loaded < required { return false }
+        }
+
+        return true
     }
 }

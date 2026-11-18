@@ -11,11 +11,13 @@ import Metal
 import MIDIKit
 import Satin
 import simd
+import Synchronization
+import os
 
 // MARK: - Detected MIDI Input
 
 /// Represents a detected MIDI input during learn mode
-public struct DetectedMIDIInput: Codable, Equatable, Identifiable, Hashable
+public struct DetectedMIDIInput: Codable, Equatable, Identifiable, Hashable, Sendable
 {
     public let id: UUID
     public var type: DetectedMIDIType
@@ -77,7 +79,7 @@ public struct DetectedMIDIInput: Codable, Equatable, Identifiable, Hashable
     }
 }
 
-public enum DetectedMIDIType: String, Codable, CaseIterable
+public enum DetectedMIDIType: String, Codable, CaseIterable, Sendable
 {
     case noteGate = "Note Gate"
     case noteVelocity = "Note Velocity"
@@ -113,7 +115,7 @@ public struct MIDIInputInfo: Codable, Equatable, Identifiable, Hashable
 
 struct MIDIInputNodeView: View
 {
-    @Bindable var node: MIDIInputNode
+    @Bindable var model: MIDIInputNode.SettingsModel
 
     var body: some View
     {
@@ -129,23 +131,28 @@ struct MIDIInputNodeView: View
                 Text("Device:")
                     .font(.system(size: 10))
 
-                Picker("", selection: $node.selectedInputID)
+                Picker("", selection: $model.selectedInputID)
                 {
                     Text("None").tag(String?.none)
 
-                    ForEach(node.availableInputs) { input in
+                    ForEach(model.availableInputs) { input in
                         Text(input.displayName).tag(Optional(input.id))
                     }
                 }
                 .pickerStyle(.menu)
-                .disabled(node.isListening)
+                .disabled(model.isListening)
 
                 Button("Refresh")
                 {
-                    node.refreshInputs()
+                    model.refreshInputs()
                 }
                 .controlSize(.small)
-                .disabled(node.isListening)
+                .disabled(model.isListening)
+            }
+
+            if let inputStatus = model.inputStatus
+            {
+                NodeStatusMessageView(status: inputStatus)
             }
 
             Divider()
@@ -153,7 +160,7 @@ struct MIDIInputNodeView: View
             // Learn mode controls
             HStack
             {
-                if node.isListening
+                if model.isListening
                 {
                     Circle()
                         .fill(.red)
@@ -167,13 +174,13 @@ struct MIDIInputNodeView: View
 
                     Button("Stop")
                     {
-                        node.stopListening()
+                        model.stopListening()
                     }
                     .controlSize(.small)
 
                     Button("Clear")
                     {
-                        node.clearDetected()
+                        model.clearDetected()
                     }
                     .controlSize(.small)
                 }
@@ -186,21 +193,21 @@ struct MIDIInputNodeView: View
 
                     Button("Listen")
                     {
-                        node.startListening()
+                        model.startListening()
                     }
                     .controlSize(.small)
-                    .disabled(node.selectedInputID == nil)
+                    .disabled(model.selectedInputID == nil)
                 }
             }
 
             // Detected inputs during learn mode OR configured ports
-            if node.isListening
+            if model.isListening
             {
                 ScrollView
                 {
                     VStack(alignment: .leading, spacing: 2)
                     {
-                        if node.detectedInputs.isEmpty
+                        if model.detectedInputs.isEmpty
                         {
                             Text("Move controls on your MIDI device...")
                                 .font(.system(size: 9))
@@ -209,7 +216,7 @@ struct MIDIInputNodeView: View
                         }
                         else
                         {
-                            ForEach(Array(node.detectedInputs.sorted(by: { $0.portName < $1.portName }))) { input in
+                            ForEach(Array(model.detectedInputs.sorted(by: { $0.portName < $1.portName }))) { input in
                                 DetectedInputRow(input: input)
                             }
                         }
@@ -217,7 +224,7 @@ struct MIDIInputNodeView: View
                 }
                 .frame(maxHeight: 150)
             }
-            else if !node.configuredInputs.isEmpty
+            else if !model.configuredInputs.isEmpty
             {
                 Text("Configured Ports:")
                     .font(.system(size: 10))
@@ -227,7 +234,7 @@ struct MIDIInputNodeView: View
                 {
                     VStack(alignment: .leading, spacing: 2)
                     {
-                        ForEach(node.configuredInputs) { input in
+                        ForEach(model.configuredInputs) { input in
                             HStack
                             {
                                 Text(input.portName)
@@ -236,7 +243,7 @@ struct MIDIInputNodeView: View
                                 Spacer()
 
                                 Button(action: {
-                                    node.removeConfiguredInput(id: input.id)
+                                    model.removeConfiguredInput(id: input.id)
                                 }) {
                                     Image(systemName: "minus.circle")
                                         .font(.system(size: 10))
@@ -253,7 +260,7 @@ struct MIDIInputNodeView: View
                     Spacer()
                     Button("Clear All")
                     {
-                        node.clearConfigured()
+                        model.clearConfigured()
                     }
                     .controlSize(.small)
                 }
@@ -306,10 +313,28 @@ struct DetectedInputRow: View
     }
 }
 
+// MARK: - Settings
+
+/// The settings of a MIDI Input node: the source selected and the controls
+/// learned from it, one output each.
+public struct MIDIInputSettings: NodeSettings
+{
+    public var selectedInputID: String?
+    public var configuredInputs: [DetectedMIDIInput]
+
+    public init(selectedInputID: String?, configuredInputs: [DetectedMIDIInput])
+    {
+        self.selectedInputID = selectedInputID
+        self.configuredInputs = configuredInputs
+    }
+}
+
 // MARK: - MIDI Input Node
 
-@Observable public class MIDIInputNode: Node
+public class MIDIInputNode: Node
 {
+    fileprivate static let log = Logger(subsystem: "graphics.fabric", category: "MIDIInputNode")
+
     override public static var name: String { "MIDI Input" }
     override public static var nodeType: Node.NodeType { .Parameter(parameterType: .IO) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Provider }
@@ -317,14 +342,14 @@ struct DetectedInputRow: View
     override public class var nodeDescription: String { "Receive MIDI messages from external devices" }
 
     // Dynamic node name based on selected input
-    override public var name: String
+    override public func deriveSubtitle() -> String?
     {
         if let inputID = selectedInputID,
            let input = availableInputs.first(where: { $0.id == inputID })
         {
             return input.name
         }
-        return Self.name
+        return nil
     }
 
     // MARK: - Codable
@@ -354,15 +379,22 @@ struct DetectedInputRow: View
         try super.encode(to: encoder)
 
         var container = encoder.container(keyedBy: MIDICodingKeys.self)
-        try container.encodeIfPresent(self.selectedInputID, forKey: .selectedInputID)
 
-        if let inputID = selectedInputID,
-           let info = availableInputs.first(where: { $0.id == inputID })
-        {
-            try container.encode(info, forKey: .savedInputInfo)
-        }
+        // Saving with the input unplugged must not forget it.
+        try container.encodeIfPresent(self.liveInputInfo() ?? self.savedInputInfo, forKey: .savedInputInfo)
+    }
 
-        try container.encode(self.configuredInputs, forKey: .configuredInputs)
+    override public var settings: (any NodeSettings)?
+    {
+        MIDIInputSettings(selectedInputID: selectedInputID, configuredInputs: configuredInputs)
+    }
+
+    override public func apply(_ settings: any NodeSettings)
+    {
+        guard let settings = settings as? MIDIInputSettings else { return }
+        if selectedInputID != settings.selectedInputID { selectedInputID = settings.selectedInputID }
+        if configuredInputs != settings.configuredInputs { configuredInputs = settings.configuredInputs }
+        super.apply(settings)
     }
 
     public required init(context: Context)
@@ -370,105 +402,258 @@ struct DetectedInputRow: View
         super.init(context: context)
     }
 
+    public convenience init(context: Context, settings: MIDIInputSettings)
+    {
+        self.init(context: context)
+        self.apply(settings)
+    }
+
     // MARK: - Properties
 
-    @ObservationIgnored private var midiManager: MIDIManager?
-    @ObservationIgnored private var savedInputInfo: MIDIInputInfo?
+    /// One CoreMIDI client for the process: MIDIKit never disposes a manager's
+    /// client, so a manager per node, or per enable, leaks one each time.
+    private static let sharedMIDIManager = MIDIManager(
+        clientName: "Fabric",
+        model: "Fabric",
+        manufacturer: "Fabric",
+        // MIDIKit calls this on main, after updating its endpoints.
+        notificationHandler: { notification in
+            if case .setupChanged = notification
+            {
+                NotificationCenter.default.post(name: .midiInputSetupChanged, object: nil)
+            }
+        }
+    )
 
-    // UI-bound properties (must NOT be @ObservationIgnored for SwiftUI updates)
+    // Connection state is main-thread state, with learn mode and the settings
+    // it serves. Lifecycle calls, which can run on the render thread, hand over
+    // to main with performOnMainAsync, which keeps them in order.
+
+    /// The shared manager while this node is enabled, nil otherwise.
+    private var midiManager: MIDIManager?
+    /// Whether the node is started. It receives MIDI while started, or while learning.
+    private var isRunning = false
+    // Not the node's id: that is saved, so two open copies of a document share it.
+    private let connectionTag = "MIDIInputNode-\(UUID())"
+    /// The input the connection receives from, or nil when there is no connection.
+    private var connectedInputID: String?
+    {
+        didSet
+        {
+            // Once reception from an input ends, a release goes unheard, and a note,
+            // pressure or bend would read as held.
+            if oldValue != nil, connectedInputID != oldValue { releaseHeldInputs() }
+        }
+    }
+    private var connectionError: String?
+    private var managerError: String?
+    private var midiSetupObserver: (any NSObjectProtocol)?
+    private var savedInputInfo: MIDIInputInfo?
+
+    /// The selected input, as last seen connected; reconnects match it.
+    private func liveInputInfo() -> MIDIInputInfo?
+    {
+        guard let inputID = selectedInputID else { return nil }
+        return availableInputs.first { $0.id == inputID }
+    }
+
     fileprivate var selectedInputID: String?
     {
         didSet
         {
-            setupMIDIConnection()
+            // Choosing none forgets the input, so an input appearing does not bring it back.
+            savedInputInfo = selectedInputID == nil ? nil : liveInputInfo() ?? savedInputInfo
+            updateMIDIConnection()
+            performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
+            // `subtitle` is derived from the selected input; notify so the title refreshes.
+            self.subtitleSubject.send()
         }
     }
 
     fileprivate var availableInputs: [MIDIInputInfo] = []
 
-    // Learn mode state
     fileprivate var isListening: Bool = false
     fileprivate var detectedInputs: Set<DetectedMIDIInput> = []
+    {
+        didSet { performOnMainSync { _settingsModelStorage?.detectedInputs = detectedInputs } }
+    }
 
-    // Configured inputs (after learning)
     fileprivate var configuredInputs: [DetectedMIDIInput] = []
     {
         didSet
         {
             rebuildPorts()
+            performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
         }
     }
 
-    // Latest values for execution (these don't need UI observation)
-    @ObservationIgnored private var floatValues: [String: Float] = [:]
-    @ObservationIgnored private var boolValues: [String: Bool] = [:]
+    // Written on the main queue, read by execute on the render thread.
+    private struct InputValues
+    {
+        var floatValues: [String: Float] = [:]
+        var boolValues: [String: Bool] = [:]
+    }
+    private let inputValues = Mutex(InputValues())
 
     // MARK: - Settings View
 
-    override public func providesSettingsView() -> Bool
-    {
-        true
-    }
+    override public func providesSettingsView() -> Bool { true }
 
     override public func settingsView() -> AnyView
     {
-        AnyView(MIDIInputNodeView(node: self))
+        performOnMainSync
+        {
+            if _settingsModelStorage == nil { _settingsModelStorage = SettingsModel(node: self) }
+            return AnyView(MIDIInputNodeView(model: _settingsModelStorage!))
+        }
     }
 
     override public var settingsSize: SettingsViewSize { .Medium }
 
-    // MARK: - Lifecycle
+    // MARK: - Settings Model
 
-    public override func enableExecution(context: GraphExecutionContext)
+    @MainActor
+    @Observable final class SettingsModel
     {
-        setupMIDIManager()
-    }
-
-    public override func disableExecution(context: GraphExecutionContext)
-    {
-        midiManager = nil
-    }
-
-    private func setupMIDIManager()
-    {
-        do
+        var selectedInputID: String?
         {
-            midiManager = MIDIManager(
-                clientName: "Fabric",
-                model: "Fabric",
-                manufacturer: "Fabric"
-            )
-
-            try midiManager?.start()
-            print("[MIDI] Manager started")
-
-            refreshInputs()
-
-            // Try to reconnect to saved input
-            if let savedInfo = savedInputInfo,
-               let matching = availableInputs.first(where: { $0.name == savedInfo.name })
+            didSet
             {
-                selectedInputID = matching.id
+                guard let node, selectedInputID != node.selectedInputID else { return }
+                node.setSettings(MIDIInputSettings(selectedInputID: selectedInputID, configuredInputs: node.configuredInputs))
             }
         }
-        catch
+        var availableInputs: [MIDIInputInfo] = []
+        /// Why the node cannot receive although it is started, or nil.
+        var inputStatus: NodeStatus?
+        var isListening: Bool = false
+        var detectedInputs: Set<DetectedMIDIInput> = []
+        var configuredInputs: [DetectedMIDIInput] = []
+
+        private weak var node: MIDIInputNode?
+
+        init(node: MIDIInputNode)
         {
-            print("[MIDI] Failed to start manager: \(error)")
+            self.node = node
+            self.selectedInputID = node.selectedInputID
+            self.availableInputs = node.availableInputs
+            self.inputStatus = node.inputStatus
+            self.isListening = node.isListening
+            self.detectedInputs = node.detectedInputs
+            self.configuredInputs = node.configuredInputs
         }
+
+        func refreshFromNode()
+        {
+            guard let node else { return }
+            if selectedInputID != node.selectedInputID { selectedInputID = node.selectedInputID }
+            if configuredInputs != node.configuredInputs { configuredInputs = node.configuredInputs }
+        }
+
+        func startListening() { node?.startListening() }
+        func stopListening() { node?.stopListening() }
+        func clearDetected() { node?.clearDetected() }
+        func clearConfigured() { node?.clearConfigured() }
+        func refreshInputs() { node?.refreshInputs() }
+        func removeConfiguredInput(id: UUID) { node?.removeConfiguredInput(id: id) }
+    }
+
+    private var _settingsModelStorage: SettingsModel? = nil
+
+    // MARK: - Lifecycle
+
+    // Enabled, the node lists inputs and can learn; started, it receives.
+    // Learning works on a node that is not started, as a new node has no ports
+    // to connect until it has learnt some.
+    public override func enableExecution(renderer: GraphRenderer)
+    throws
+    {
+        performOnMainAsync {
+            // Started here, on main, never by blocking on main: a host whose main
+            // thread waits on rendering would deadlock. Every start then runs on
+            // main, one at a time, which MIDIKit's start() needs, as it checks
+            // whether it has started without a lock. Starting a started manager
+            // does nothing.
+            do
+            {
+                try Self.sharedMIDIManager.start()
+                self.managerError = nil
+            }
+            catch
+            {
+                self.managerError = "Cannot start MIDI: \(error.localizedDescription)"
+                self.updateInputStatus()
+                return
+            }
+
+            self.midiManager = Self.sharedMIDIManager
+            self.midiSetupObserver = NotificationCenter.default.addObserver(
+                forName: .midiInputSetupChanged, object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.midiSetupDidChange()
+            }
+            self.refreshInputs()
+
+            // Try to reconnect to saved input
+            if let savedInfo = self.savedInputInfo,
+               let matching = self.availableInputs.first(where: { $0.name == savedInfo.name })
+            {
+                self.selectedInputID = matching.id
+            }
+        }
+        try super.enableExecution(renderer: renderer)
+    }
+
+    public override func startExecution(renderer: GraphRenderer)
+    throws
+    {
+        performOnMainAsync {
+            self.isRunning = true
+            self.updateMIDIConnection()
+        }
+        try super.startExecution(renderer: renderer)
+    }
+
+    public override func stopExecution(renderer: GraphRenderer)
+    throws
+    {
+        performOnMainAsync {
+            self.isRunning = false
+            self.updateMIDIConnection()
+        }
+        try super.stopExecution(renderer: renderer)
+    }
+
+    public override func disableExecution(renderer: GraphRenderer)
+    throws
+    {
+        // The closure holds the node: a deleted node's connection on the shared
+        // manager must still go.
+        performOnMainAsync {
+            self.midiManager?.remove(.inputConnection, .withTag(self.connectionTag))
+            self.midiManager = nil
+            self.connectedInputID = nil
+            if let observer = self.midiSetupObserver { NotificationCenter.default.removeObserver(observer) }
+            self.midiSetupObserver = nil
+        }
+        try super.disableExecution(renderer: renderer)
     }
 
     fileprivate func refreshInputs()
     {
         guard let manager = midiManager else { return }
 
-        // List output endpoints - these are devices that SEND MIDI data (controllers, keyboards, etc.)
         availableInputs = manager.endpoints.outputs.map { endpoint in
             MIDIInputInfo(
                 id: endpoint.uniqueID.description,
                 name: endpoint.displayName,
-                manufacturer: endpoint.manufacturer
+                manufacturer: endpoint.manufacturer.value
             )
         }
+
+        performOnMainSync { _settingsModelStorage?.availableInputs = availableInputs }
+        // `subtitle` resolves against the input list; notify so the title refreshes.
+        self.subtitleSubject.send()
 
         print("[MIDI] Found \(availableInputs.count) MIDI sources:")
         for input in availableInputs
@@ -477,39 +662,162 @@ struct DetectedInputRow: View
         }
     }
 
-    private func setupMIDIConnection()
+    private func updateMIDIConnection()
     {
+        defer { updateInputStatus() }
+        connectionError = nil
+
         guard let manager = midiManager else { return }
 
-        guard
+        guard isRunning || isListening,
               let inputID = selectedInputID,
               let endpoint = manager.endpoints.outputs.first(where: { $0.uniqueID.description == inputID })
         else
         {
             // Remove existing connection if any
-            manager.remove(.inputConnection, .all)
+            manager.remove(.inputConnection, .withTag(connectionTag))
+            connectedInputID = nil
             return
         }
 
         do
         {
             // Remove existing connections
-            manager.remove(.inputConnection, .all)
+            manager.remove(.inputConnection, .withTag(connectionTag))
 
             // Create new connection to receive from this output endpoint
             try manager.addInputConnection(
                 to: .outputs([endpoint]),
-                tag: "FabricMIDI",
+                tag: connectionTag,
                 receiver: .events { [weak self] events, _, _ in
-                    self?.handleMIDIEvents(events)
+                    // Handling reads and writes learn-mode and configuration state the settings view owns.
+                    guard let self else { return }
+                    self.performOnMainAsync {
+                        // Events queued before this connection ended would press inputs
+                        // its end released.
+                        guard self.connectedInputID == inputID else { return }
+                        self.handleMIDIEvents(events)
+                    }
                 }
             )
 
+            connectedInputID = inputID
             print("[MIDI] Connected to: \(endpoint.displayName)")
         }
         catch
         {
-            print("[MIDI] Failed to connect: \(error)")
+            connectedInputID = nil
+            connectionError = "Cannot connect to \(endpoint.displayName): \(error.localizedDescription)"
+        }
+    }
+
+    /// An input appearing or going. One that returns may have a new id, so it is
+    /// matched by name, as enable does; one with the same id needs connecting afresh.
+    private func midiSetupDidChange()
+    {
+        refreshInputs()
+
+        if liveInputInfo() == nil
+        {
+            connectedInputID = nil
+            if let savedInfo = savedInputInfo,
+               let matching = availableInputs.first(where: { $0.name == savedInfo.name })
+            {
+                selectedInputID = matching.id
+                return
+            }
+        }
+
+        if connectedInputID != selectedInputID
+        {
+            updateMIDIConnection()
+        }
+        else
+        {
+            updateInputStatus()
+        }
+    }
+
+    /// Sets each input as its release leaves it. A CC is a position, not held, so it keeps its value.
+    private func releaseHeldInputs()
+    {
+        let heldInputs = configuredInputs.filter { $0.type != .controlChange }
+        guard !heldInputs.isEmpty else { return }
+
+        inputValues.withLock { values in
+            for input in heldInputs
+            {
+                Self.rest(input, in: &values)
+            }
+        }
+        markDirty()
+    }
+
+    /// Sets an input to its value at rest: a note off, velocity and pressure
+    /// zero, pitch bend centred, and a CC not yet heard at zero.
+    private static func rest(_ input: DetectedMIDIInput, in values: inout InputValues)
+    {
+        switch input.type
+        {
+        case .noteGate:
+            values.boolValues[input.uniqueKey] = false
+        case .noteVelocity, .aftertouch, .controlChange:
+            values.floatValues[input.uniqueKey] = 0.0
+        case .pitchBend:
+            values.floatValues[input.uniqueKey] = 0.5
+        }
+    }
+
+    // MARK: - Input Status
+
+    /// Set while the node is started but cannot receive from its input. Worded
+    /// once, in updateInputStatus(), so the glyph, the settings view and the log agree.
+    private var inputStatus: NodeStatus?
+    {
+        didSet
+        {
+            guard inputStatus != oldValue else { return }
+            if let inputStatus
+            {
+                Self.log.error("\(inputStatus.message, privacy: .public)")
+            }
+            performOnMainSync { _settingsModelStorage?.inputStatus = inputStatus }
+            self.subtitleSubject.send()
+        }
+    }
+
+    override public func deriveStatuses() -> [NodeStatus] { inputStatus.map { [$0] } ?? [] }
+
+    // No Retry: an input returning reconnects itself.
+    private func updateInputStatus()
+    {
+        if !isRunning
+        {
+            inputStatus = nil
+        }
+        else if let managerError
+        {
+            inputStatus = .error(managerError)
+        }
+        else if midiManager == nil
+        {
+            inputStatus = nil
+        }
+        else if let connectionError
+        {
+            inputStatus = .error(connectionError)
+        }
+        else if selectedInputID == nil
+        {
+            inputStatus = .warning("No MIDI input is selected.")
+        }
+        else if liveInputInfo() == nil
+        {
+            inputStatus = .warning("\(savedInputInfo?.displayName ?? "The selected MIDI input") is not connected.")
+        }
+        else
+        {
+            inputStatus = nil
         }
     }
 
@@ -520,6 +828,8 @@ struct DetectedInputRow: View
         print("[MIDI] Learn mode starting... isListening was \(isListening)")
         isListening = true
         detectedInputs.removeAll()
+        performOnMainSync { _settingsModelStorage?.isListening = true }
+        updateMIDIConnection()
         print("[MIDI] Learn mode started. isListening is now \(isListening)")
     }
 
@@ -528,14 +838,13 @@ struct DetectedInputRow: View
         print("[MIDI] Stopping learn mode. Detected \(detectedInputs.count) inputs")
         isListening = false
 
-        // Convert detected inputs to configured inputs
+        var learnedInputs = configuredInputs
         for detected in detectedInputs
         {
             print("[MIDI] Processing detected: \(detected.portName)")
-            // Skip if we already have this input configured
-            if !configuredInputs.contains(where: { $0.uniqueKey == detected.uniqueKey })
+            if !learnedInputs.contains(where: { $0.uniqueKey == detected.uniqueKey })
             {
-                configuredInputs.append(detected)
+                learnedInputs.append(detected)
                 print("[MIDI] Added to configured: \(detected.portName)")
             }
             else
@@ -544,7 +853,11 @@ struct DetectedInputRow: View
             }
         }
 
+        setSettings(MIDIInputSettings(selectedInputID: selectedInputID, configuredInputs: learnedInputs))
+
         detectedInputs.removeAll()
+        performOnMainSync { _settingsModelStorage?.isListening = false }
+        updateMIDIConnection()
         print("[MIDI] Learn mode stopped. Total configured: \(configuredInputs.count) inputs. isListening is now \(isListening)")
     }
 
@@ -555,12 +868,12 @@ struct DetectedInputRow: View
 
     fileprivate func clearConfigured()
     {
-        configuredInputs.removeAll()
+        setSettings(MIDIInputSettings(selectedInputID: selectedInputID, configuredInputs: []))
     }
 
     fileprivate func removeConfiguredInput(id: UUID)
     {
-        configuredInputs.removeAll(where: { $0.id == id })
+        setSettings(MIDIInputSettings(selectedInputID: selectedInputID, configuredInputs: configuredInputs.filter { $0.id != id }))
     }
 
     // MARK: - MIDI Event Handling
@@ -644,9 +957,9 @@ struct DetectedInputRow: View
                 switch input.type
                 {
                 case .noteGate:
-                    boolValues[input.uniqueKey] = true
+                    inputValues.withLock { $0.boolValues[input.uniqueKey] = true }
                 case .noteVelocity:
-                    floatValues[input.uniqueKey] = normalizedVel
+                    inputValues.withLock { $0.floatValues[input.uniqueKey] = normalizedVel }
                 default:
                     break
                 }
@@ -677,9 +990,9 @@ struct DetectedInputRow: View
                 switch input.type
                 {
                 case .noteGate:
-                    boolValues[input.uniqueKey] = false
+                    inputValues.withLock { $0.boolValues[input.uniqueKey] = false }
                 case .noteVelocity:
-                    floatValues[input.uniqueKey] = 0.0
+                    inputValues.withLock { $0.floatValues[input.uniqueKey] = 0.0 }
                 default:
                     break
                 }
@@ -710,7 +1023,7 @@ struct DetectedInputRow: View
         {
             if input.type == .controlChange && input.channel == channel && input.number == cc
             {
-                floatValues[input.uniqueKey] = normalizedValue
+                inputValues.withLock { $0.floatValues[input.uniqueKey] = normalizedValue }
             }
         }
         markDirty()
@@ -739,7 +1052,7 @@ struct DetectedInputRow: View
         {
             if input.type == .pitchBend && input.channel == channel
             {
-                floatValues[input.uniqueKey] = normalizedValue
+                inputValues.withLock { $0.floatValues[input.uniqueKey] = normalizedValue }
             }
         }
         markDirty()
@@ -767,7 +1080,7 @@ struct DetectedInputRow: View
         {
             if input.type == .aftertouch && input.channel == channel
             {
-                floatValues[input.uniqueKey] = normalizedValue
+                inputValues.withLock { $0.floatValues[input.uniqueKey] = normalizedValue }
             }
         }
         markDirty()
@@ -777,51 +1090,34 @@ struct DetectedInputRow: View
 
     private func rebuildPorts()
     {
-        let portNamesWeNeed = Set(configuredInputs.map { $0.portName })
-        let existingPortNames = Set(outputPorts().map { $0.name })
-
-        let portsToRemove = existingPortNames.subtracting(portNamesWeNeed)
-
-        for portName in portsToRemove
-        {
-            if let port = findPort(named: portName)
-            {
-                removePort(port)
-            }
+        let descriptors = configuredInputs.map {
+            DeviceOutputPortDescriptor(name: $0.portName, isButton: $0.type == .noteGate)
         }
 
-        for input in configuredInputs
+        let created = Set(synchronizeDeviceOutputPorts(to: descriptors,
+                                                       buttonDescription: "MIDI note gate (true while note is held)",
+                                                       axisDescription: "MIDI value normalized from 0 to 1").map(\.name))
+
+        // Values are keyed by control identity rather than port name, so the
+        // seeding cannot ride along inside the sync.
+        for input in configuredInputs where created.contains(input.portName)
         {
-            let portName = input.portName
+            inputValues.withLock { Self.rest(input, in: &$0) }
 
-            if findPort(named: portName) != nil
-            {
-                continue
-            }
-
-            let port: Port
-            if input.type == .noteGate
-            {
-                port = NodePort<Bool>(name: portName, kind: .Outlet, description: "MIDI note gate (true while note is held)")
-                boolValues[input.uniqueKey] = false
-            }
-            else
-            {
-                port = NodePort<Float>(name: portName, kind: .Outlet, description: "MIDI value normalized from 0 to 1")
-                floatValues[input.uniqueKey] = 0.0
-            }
-
-            addDynamicPort(port)
-            print("[MIDI] Added port: \(portName)")
+            print("[MIDI] Added port: \(input.portName)")
         }
     }
 
     // MARK: - Execution
 
-    public override func execute(context: GraphExecutionContext,
-                                  renderPassDescriptor: MTLRenderPassDescriptor,
-                                  commandBuffer: MTLCommandBuffer)
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
+        let currentValues = inputValues.withLock { $0 }
+
         for input in configuredInputs
         {
             let portName = input.portName
@@ -829,7 +1125,7 @@ struct DetectedInputRow: View
             if input.type == .noteGate
             {
                 if let port = findPort(named: portName) as? NodePort<Bool>,
-                   let value = boolValues[input.uniqueKey]
+                   let value = currentValues.boolValues[input.uniqueKey]
                 {
                     port.send(value)
                 }
@@ -837,11 +1133,17 @@ struct DetectedInputRow: View
             else
             {
                 if let port = findPort(named: portName) as? NodePort<Float>,
-                   let value = floatValues[input.uniqueKey]
+                   let value = currentValues.floatValues[input.uniqueKey]
                 {
                     port.send(value)
                 }
             }
         }
     }
+}
+
+private extension Notification.Name
+{
+    /// Posted on main when the shared MIDI manager's setup changes.
+    static let midiInputSetupChanged = Notification.Name("graphics.fabric.MIDIInputNode.setupChanged")
 }

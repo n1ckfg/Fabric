@@ -15,7 +15,7 @@ import Sparkle
 struct FabricApp: App {
     
     private let updaterController: SPUStandardUpdaterController
-
+    
     init()
     {
         // If you want to start the updater manually, pass false to startingUpdater and call .startUpdater() later
@@ -28,48 +28,21 @@ struct FabricApp: App {
 
         DocumentGroup(newDocument: FabricDocument(withTemplate: true) ) { file in
             
-            ContentView(document: file.$document)
+            ContentView(document: file.document, documentURL: file.fileURL)
+                // Presentation and canvas state belong to this document instance.
+                .id(ObjectIdentifier(file.document))
                 .focusedSceneValue(\.document, file.$document)
 
-                .onAppear {
-                    // THIS SHIT HAS TO BE ON MAIN THREAD FOR APPKIT
-                    file.document.setupOutputWindow()
-                }
-                .onDisappear {
-                    // THIS SHIT HAS TO BE ON MAIN THREAD FOR APPKIT
-                    file.document.closeOutputWindow()
-                }
-                
         }
         .commands {
-            AboutCommands()
-            
             DocumentCommands()
-            
+
+            ViewCommands()
+            GraphCanvasZoomCommands()
+
             CommandGroup(after: .appInfo)
             {
                 CheckForUpdatesView(updater: updaterController.updater)
-            }
-            
-           
-        }
-        
-        Window("About Fabric Editor", id: "about") {
-            AboutView()
-        }
-        .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
-        .defaultPosition(.center)
-    }
-}
-
-struct AboutCommands: Commands {
-    @Environment(\.openWindow) private var openWindow
-    
-    var body: some Commands {
-        CommandGroup(replacing: .appInfo) {
-            Button("About Fabric Editor") {
-                openWindow(id: "about")
             }
         }
     }
@@ -78,58 +51,169 @@ struct AboutCommands: Commands {
 struct DocumentCommands:Commands
 {
     @FocusedBinding(\.document) var document: FabricDocument?
+    @FocusedValue(\.editorFocusTarget) var editorFocusTarget: Binding<FabricEditorFocusTarget?>?
+
+    private var activeDocument: FabricDocument? {
+        self.document ?? ActiveFabricDocumentStore.shared.activeDocument
+    }
+
+    /// Derived from real keyboard focus: false whenever any text field
+    /// (node settings, rename, registry search) is being edited, so the
+    /// pasteboard commands below route to the field editor instead.
+    private var isCanvasFocused: Bool {
+        self.editorFocusTarget?.wrappedValue == .canvas
+    }
 
     var body: some Commands {
 
         CommandGroup(replacing: .pasteboard)
         {
-            let graph = self.document?.graph.activeSubGraph ?? self.document?.graph
-            let hasSelection = graph?.nodes.contains(where: { $0.isSelected }) ?? false
+            let graph = self.document?.editingContext.currentGraph
+            let hasSelection = !(graph?.selectedNodes.isEmpty ?? true)
             let hasPasteData = NSPasteboard.general.data(forType: Graph.nodeClipboardType) != nil
 
             Button("Copy")
             {
-                guard let graph else { return }
-                let selected = graph.nodes.filter { $0.isSelected }
-                graph.copyNodesToPasteboard(selected)
+                if self.isCanvasFocused {
+                    guard let graph else { return }
+                    graph.copyNodesToPasteboard(graph.selectedNodes)
+                }
+                else
+                {
+                    NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+                }
             }
             .keyboardShortcut("c", modifiers: .command)
-            .disabled(!hasSelection)
+            .disabled(self.isCanvasFocused ? !hasSelection : false)
 
             Button("Paste")
             {
-                graph?.pasteNodesFromPasteboard()
+                if self.isCanvasFocused {
+                    graph?.pasteNodesFromPasteboard()
+                }
+                else
+                {
+                    NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+                }
             }
             .keyboardShortcut("v", modifiers: .command)
-            .disabled(!hasPasteData)
+            .disabled(self.isCanvasFocused ? !hasPasteData : false)
 
             Button("Duplicate")
             {
                 guard let graph else { return }
-                let selected = graph.nodes.filter { $0.isSelected }
-                graph.duplicateNodes(selected)
+                graph.duplicateNodes(graph.selectedNodes)
             }
             .keyboardShortcut("d", modifiers: .command)
-            .disabled(!hasSelection)
+            .disabled(self.isCanvasFocused ? !hasSelection : true)
         }
-        
+
         CommandGroup(after: .pasteboard)
         {
             Button("Select All Nodes")
             {
-                let graph = self.document?.graph.activeSubGraph ?? self.document?.graph
-                graph?.selectAllNodes()
-                print("Select All")
+                if self.isCanvasFocused
+                {
+                    self.document?.editingContext.currentGraph.selectAllNodes()
+                }
+                else
+                {
+                    NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+                }
             }
             .keyboardShortcut(KeyEquivalent("a"), modifiers: .command)
-            .disabled( self.document?.graph.nodes.isEmpty ?? true)
+            .disabled(self.isCanvasFocused ? (self.document?.editingContext.currentGraph.nodes.isEmpty ?? true) : false)
+
+            Button("Find Nodes")
+            {
+                self.editorFocusTarget?.wrappedValue = .registrySearch
+            }
+            .keyboardShortcut(.return, modifiers: .command)
+            .disabled(self.isCanvasFocused ? (self.document?.editingContext.currentGraph.nodes.isEmpty ?? true) : false)
+        }
+
+        CommandGroup(after: .saveItem)
+        {
+            Divider() // Optional: separates the submenu from system items
+            
+            Menu("Export")
+            {
+                Button("Image…")
+                {
+                    self.activeDocument?.exportSnapshotImage()
+                }
+                .disabled(self.activeDocument == nil)
+                
+                Button("Movie…")
+                {
+                    self.activeDocument?.exportMovie()
+                }
+                .disabled(self.activeDocument == nil)
+
+            }
         }
     }
 }
 
 
+struct ViewCommands: Commands {
+    @FocusedBinding(\.document) var document: FabricDocument?
+
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            let graph = document?.editingContext.currentGraph
+            let settingsViewModels = graph.map { g in
+                g.selectedNodes.map { g.viewModel(for: $0) }.filter { $0.providesSettingsView() }
+            } ?? []
+            let allOpen = !settingsViewModels.isEmpty && settingsViewModels.allSatisfy(\.showSettings)
+
+            Button(allOpen ? "Hide Node Settings" : "Show Node Settings") {
+                for viewModel in settingsViewModels {
+                    viewModel.showSettings = !allOpen
+                }
+            }
+            .keyboardShortcut("i", modifiers: .command)
+            .disabled(settingsViewModels.isEmpty)
+
+            Divider()
+
+            Button("Auto Layout Graph") {
+                // Operate on the graph the user is currently looking
+                // at (a subgraph if they've drilled in), not the
+                // document's root.
+                document?.editingContext.currentGraph.autoLayout()
+            }
+            .keyboardShortcut("l", modifiers: [.command, .option])
+            .disabled(document == nil)
+
+            Divider()
+        }
+
+        CommandGroup(after: .windowArrangement) {
+            Menu("Output") {
+                // The getter reads live rather than a value captured at body
+                // evaluation, so the checkmark is current whenever the menu
+                // opens even if Commands bodies aren't observation-tracked.
+                Picker("Destination", selection: Binding(
+                    get: { OutputSettings.shared.mode },
+                    set: { OutputSettings.shared.mode = $0 }
+                )) {
+                    Text("In-Editor").tag(OutputPresentationMode.editorCanvas)
+                    Text("Window").tag(OutputPresentationMode.separateWindow)
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            }
+        }
+    }
+}
+
 struct DocumentFocusedValueKey: FocusedValueKey {
   typealias Value = Binding<FabricDocument>
+}
+
+struct EditorFocusTargetValueKey: FocusedValueKey {
+    typealias Value = Binding<FabricEditorFocusTarget?>
 }
 
 extension FocusedValues
@@ -143,7 +227,16 @@ extension FocusedValues
             self[DocumentFocusedValueKey.self] = newValue
         }
     }
+
+    /// A read/write window onto ContentView's `@FocusState` — the editor's
+    /// single keyboard-focus authority.
+    var editorFocusTarget: EditorFocusTargetValueKey.Value?
+    {
+        get {
+            self[EditorFocusTargetValueKey.self]
+        }
+        set {
+            self[EditorFocusTargetValueKey.self] = newValue
+        }
+    }
 }
-
-
-

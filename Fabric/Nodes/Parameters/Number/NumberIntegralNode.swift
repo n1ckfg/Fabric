@@ -30,19 +30,30 @@ public class NumberIntegralNode : Node
         return ports +
         [
             ("inputNumber", ParameterPort(parameter: FloatParameter("Number", 0.0, .inputfield, "Value to integrate over time"))),
-            ("outputNumber", NodePort<Float>(name: NumberNode.name , kind: .Outlet, description: "Accumulated sum of input values over time")),
+            ("inputReset", ParameterPort(parameter: BoolParameter("Reset", false, .button, "Hold the Integral at zero while on"))),
+            ("outputNumber", NodePort<Float>(name: "Number" , kind: .Outlet, description: "Accumulated sum of input values over time")),
         ]
     }
     
     // Port Proxy
     public var inputNumber:ParameterPort<Float> { port(named: "inputNumber") }
+    public var inputReset:ParameterPort<Bool> { port(named: "inputReset") }
     public var outputNumber:NodePort<Float> { port(named: "outputNumber") }
     
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
-        self.state += (self.inputNumber.value ?? 0.0) * -Float(context.timing.deltaTime)
+        if self.inputReset.value == true
+        {
+            self.state = 0.0
+        }
+        else
+        {
+            self.state += (self.inputNumber.value ?? 0.0) * Float(executionInfo.timing.deltaTime)
+        }
         
         self.outputNumber.send(self.state)
     }

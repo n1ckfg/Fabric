@@ -16,6 +16,7 @@ public class BaseMaterialNode : Node
     override public class var nodeType:Node.NodeType { .Material }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
     override public class var nodeTimeMode: Node.TimeMode { .None }
+    override public class var nodeDescription: String { "Base class for material nodes" }
 
     // Port Registration
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -41,13 +42,7 @@ public class BaseMaterialNode : Node
     open var material: Material {
         fatalError("Subclasses must override material")
     }
-    
-    override public func startExecution(context: GraphExecutionContext)
-    {
-        super.startExecution(context: context)
-        self.material.context = context.graphRenderer?.context
-    }
-    
+        
     public func evaluate(material:Material, atTime:TimeInterval) -> Bool
     {
         var shouldOutput = false
@@ -89,11 +84,9 @@ public class BaseMaterialNode : Node
         return shouldOutput
     }
     
-    public override func execute(context:GraphExecutionContext,
-                                 renderPassDescriptor: MTLRenderPassDescriptor,
-                                 commandBuffer: MTLCommandBuffer)
+    public override func execute(renderer:GraphRenderer, executionInfo:GraphExecutionInfo, renderPassDescriptor: MTLRenderPassDescriptor, commandBuffer: MTLCommandBuffer) throws
     {
-        let shouldOutput = self.evaluate(material: self.material, atTime: context.timing.time)
+        let shouldOutput = self.evaluate(material: self.material, atTime: executionInfo.timing.time)
 
         if shouldOutput
         {

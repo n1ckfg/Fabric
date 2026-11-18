@@ -10,7 +10,7 @@ public final class GaussianBlurNode: BaseMultiPassBlurEffectNode {
     override public class var nodeTimeMode: Node.TimeMode { .None }
     override public class var nodeDescription: String { "Separable Gaussian-style blur with progressive downsample passes." }
 
-    override class var sourceShaderName: String { "GaussianBlurShader" }
+    override public class var sourceShaderName: String { "GaussianBlurShader" }
 
     private struct GaussianPassUniforms {
         var direction: simd_float2
@@ -18,7 +18,7 @@ public final class GaussianBlurNode: BaseMultiPassBlurEffectNode {
         var padding: Float
     }
 
-    @ObservationIgnored private var passUniformsBuffers: [StructBuffer<GaussianPassUniforms>] = []
+    private var passUniformsBuffers: [StructBuffer<GaussianPassUniforms>] = []
 
     required init(context: Context, fileURL: URL) throws {
         try super.init(context: context, fileURL: fileURL)
@@ -42,18 +42,19 @@ public final class GaussianBlurNode: BaseMultiPassBlurEffectNode {
         return self.passUniformsBuffers[index]
     }
 
-    override public func execute(context: GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
-//        guard self.shouldExecuteThisFrame() else {
-//            return
-//        }
-
-        guard let inputTexture = self.inputTexturePort.value?.texture else {
+        guard let inputImage = self.validatedSingleInputImage() else {
             self.outputTexturePort.send(nil)
             return
         }
+
+        let outputWidth = Int(inputImage.presentationSize.width.rounded())
+        let outputHeight = Int(inputImage.presentationSize.height.rounded())
 
         let amount = self.floatParameterValue(named: "Amount")
 
@@ -80,8 +81,8 @@ public final class GaussianBlurNode: BaseMultiPassBlurEffectNode {
 
             for stage in stageRatios
             {
-                let stageSize = self.scaledPassSize(baseWidth: inputTexture.width,
-                                                    baseHeight: inputTexture.height,
+                let stageSize = self.scaledPassSize(baseWidth: outputWidth,
+                                                    baseHeight: outputHeight,
                                                     amount: amount,
                                                     passRatio: stage.ratio)
 
@@ -96,15 +97,16 @@ public final class GaussianBlurNode: BaseMultiPassBlurEffectNode {
                                            vector: simd_float2(0.0, 1.0)))
             }
 
-        steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 0.333, vector: simd_float2(1.0, 0.0)))
-        steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 0.333, vector: simd_float2(0.0, 1.0)))
+        steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 0.333, vector: simd_float2(1.0, 0.0)))
+        steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 0.333, vector: simd_float2(0.0, 1.0)))
 //        }
-
-        let outputImage = self.runPassChain(context: context,
-                                               commandBuffer: commandBuffer,
-                                               inputTexture: inputTexture,
-                                               steps: steps,
-                                               prepareStep: { [weak self] stepIndex, step in
+        
+        let outputImage = try self.runPassChain(renderer: renderer,
+                                            executionInfo: executionInfo,
+                                            commandBuffer: commandBuffer,
+                                            inputImage: inputImage,
+                                            steps: steps,
+                                            prepareStep: { [weak self] stepIndex, step in
             guard let self else { return }
 
             let passUniforms = GaussianPassUniforms(direction: step.vector,

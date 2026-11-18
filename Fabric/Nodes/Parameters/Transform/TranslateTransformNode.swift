@@ -12,11 +12,11 @@ import Metal
 
 public class TranslateTransformNode : Node
 {
-    override public class var name:String { "Translate A Transform" }
+    override public class var name:String { "Transform Translate" }
     override public class var nodeType:Node.NodeType { .Parameter(parameterType: .Transform) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
     override public class var nodeTimeMode: Node.TimeMode { .None }
-    override public class var nodeDescription: String { "Translate a Transform"}
+    override public class var nodeDescription: String { "Translate a transform"}
     
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
@@ -24,20 +24,22 @@ public class TranslateTransformNode : Node
         
         return ports +
         [
-            ("inputTransform", NodePort<simd_float4x4>(name: "Transform" , kind: .Inlet, description: "4x4 transform matrix to translate")),
-            ("inputTranslation", NodePort<simd_float3>(name: "Translation" , kind: .Inlet, description: "XYZ translation offset to apply")),
+            ("inputTransform", PortType.Transform.makeFreshPort(name: "Transform", kind: .Inlet, description: "4x4 transform matrix to translate")),
+            ("inputTranslation", ParameterPort(parameter: Float3Parameter("Translation", simd_float3(0, 0, 0), .inputfield, "XYZ translation offset to apply"))),
             ("outputTransform", NodePort<simd_float4x4>(name: "Transform" , kind: .Outlet, description: "Translated 4x4 transform matrix")),
         ]
     }
-    
+
     // Port Proxy
     public var inputTransform:NodePort<simd_float4x4> { port(named: "inputTransform") }
-    public var inputTranslation:NodePort<simd_float3> { port(named: "inputTranslation") }
+    public var inputTranslation:ParameterPort<simd_float3> { port(named: "inputTranslation") }
     public var outputTransform:NodePort<simd_float4x4> { port(named: "outputTransform") }
     
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputTranslation.valueDidChange || self.inputTransform.valueDidChange,
            let inputTransform = self.inputTransform.value,

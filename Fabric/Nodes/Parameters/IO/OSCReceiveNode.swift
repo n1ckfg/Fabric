@@ -11,11 +11,13 @@ import Metal
 internal import OSCKit
 import Satin
 import simd
+import Synchronization
+import os
 
 // MARK: - OSC Address Binding
 
 /// Represents a configured OSC address to listen for
-public struct OSCAddressBinding: Codable, Equatable, Identifiable
+public struct OSCAddressBinding: Codable, Equatable, Identifiable, Sendable
 {
     public let id: UUID
     public var address: String
@@ -36,7 +38,7 @@ public struct OSCAddressBinding: Codable, Equatable, Identifiable
     }
 }
 
-public enum OSCDataType: String, Codable, CaseIterable
+public enum OSCDataType: String, Codable, CaseIterable, Sendable
 {
     case float = "Float"
     case int = "Int"
@@ -55,16 +57,32 @@ public enum OSCDataType: String, Codable, CaseIterable
     }
 }
 
+// MARK: - Settings
+
+/// The settings of an OSC Receive node: the port it listens on and the
+/// addresses it hands out, one output each.
+public struct OSCReceiveSettings: NodeSettings
+{
+    public var listenPort: UInt16
+    public var addressBindings: [OSCAddressBinding]
+
+    public init(listenPort: UInt16, addressBindings: [OSCAddressBinding])
+    {
+        self.listenPort = listenPort
+        self.addressBindings = addressBindings
+    }
+}
+
 // MARK: - Settings View
 
 struct OSCAddressConfigView: View
 {
-    @Bindable var node: OSCReceiveNode
+    @Bindable var model: OSCReceiveNode.SettingsModel
     let bindingID: UUID
 
     private var bindingIndex: Int?
     {
-        node.addressBindings.firstIndex(where: { $0.id == bindingID })
+        model.addressBindings.firstIndex(where: { $0.id == bindingID })
     }
 
     var body: some View
@@ -74,18 +92,18 @@ struct OSCAddressConfigView: View
             HStack
             {
                 TextField("Address", text: Binding(
-                    get: { node.addressBindings[index].address },
+                    get: { model.addressBindings[index].address },
                     set: { newValue in
-                        node.addressBindings[index].address = newValue
+                        model.addressBindings[index].address = newValue
                     }
                 ))
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .font(.system(size: 10))
 
                 Picker("", selection: Binding(
-                    get: { node.addressBindings[index].dataType },
+                    get: { model.addressBindings[index].dataType },
                     set: { newValue in
-                        node.addressBindings[index].dataType = newValue
+                        model.addressBindings[index].dataType = newValue
                     }
                 ))
                 {
@@ -97,7 +115,7 @@ struct OSCAddressConfigView: View
                 .frame(width: 80)
 
                 Button(action: {
-                    node.removeAddressBinding(id: bindingID)
+                    model.removeAddressBinding(id: bindingID)
                 }) {
                     Image(systemName: "minus.circle")
                 }
@@ -109,7 +127,7 @@ struct OSCAddressConfigView: View
 
 struct OSCReceiveNodeView: View
 {
-    @Bindable var node: OSCReceiveNode
+    @Bindable var model: OSCReceiveNode.SettingsModel
 
     var body: some View
     {
@@ -124,25 +142,28 @@ struct OSCReceiveNodeView: View
                 Text("Port:")
                     .font(.system(size: 10))
 
-                TextField("Port", value: $node.listenPort, format: .number)
+                TextField("Port", value: $model.listenPort, format: .number)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .font(.system(size: 10))
                     .frame(width: 80)
 
                 Spacer()
+            }
 
-                Button(node.isListening ? "Stop" : "Start")
+            if let serverStatus = model.serverStatus
+            {
+                HStack
                 {
-                    if node.isListening
+                    NodeStatusMessageView(status: serverStatus)
+
+                    Spacer()
+
+                    Button("Retry")
                     {
-                        node.stopListening()
+                        model.retryServer()
                     }
-                    else
-                    {
-                        node.startListening()
-                    }
+                    .controlSize(.small)
                 }
-                .controlSize(.small)
             }
 
             Divider()
@@ -154,8 +175,8 @@ struct OSCReceiveNodeView: View
             {
                 VStack(alignment: .leading, spacing: 4)
                 {
-                    ForEach(node.addressBindings) { binding in
-                        OSCAddressConfigView(node: node, bindingID: binding.id)
+                    ForEach(model.addressBindings) { binding in
+                        OSCAddressConfigView(model: model, bindingID: binding.id)
                     }
                 }
             }
@@ -167,7 +188,7 @@ struct OSCReceiveNodeView: View
 
                 Button("+")
                 {
-                    node.addAddressBinding()
+                    model.addAddressBinding()
                 }
                 .controlSize(.small)
 
@@ -182,8 +203,10 @@ struct OSCReceiveNodeView: View
 
 // MARK: - OSC Receive Node
 
-@Observable public class OSCReceiveNode: Node
+public class OSCReceiveNode: Node
 {
+    fileprivate static let log = Logger(subsystem: "graphics.fabric", category: "OSCReceiveNode")
+
     override public static var name: String { "OSC Receive" }
     override public static var nodeType: Node.NodeType { .Parameter(parameterType: .IO) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Provider }
@@ -212,13 +235,18 @@ struct OSCReceiveNodeView: View
         self.rebuildPorts()
     }
 
-    public override func encode(to encoder: Encoder) throws
+    override public var settings: (any NodeSettings)?
     {
-        try super.encode(to: encoder)
+        OSCReceiveSettings(listenPort: listenPort, addressBindings: addressBindings)
+    }
 
-        var container = encoder.container(keyedBy: OSCReceiveCodingKeys.self)
-        try container.encode(self.listenPort, forKey: .listenPort)
-        try container.encode(self.addressBindings, forKey: .addressBindings)
+    override public func apply(_ settings: any NodeSettings)
+    {
+        guard let settings = settings as? OSCReceiveSettings else { return }
+        // Setting the port restarts a running listener.
+        if settings.listenPort != listenPort { listenPort = settings.listenPort }
+        if settings.addressBindings != addressBindings { addressBindings = settings.addressBindings }
+        super.apply(settings)
     }
 
     public required init(context: Context)
@@ -226,72 +254,165 @@ struct OSCReceiveNodeView: View
         super.init(context: context)
     }
 
+    public convenience init(context: Context, listenPort: UInt16, addressBindings: [OSCAddressBinding] = [])
+    {
+        self.init(context: context)
+        self.listenPort = listenPort
+        self.addressBindings = addressBindings
+        self.rebuildPorts()
+    }
+
+    public convenience init(context: Context, settings: OSCReceiveSettings)
+    {
+        self.init(context: context, listenPort: settings.listenPort, addressBindings: settings.addressBindings)
+    }
+
     // MARK: - Properties
 
-    @ObservationIgnored fileprivate var listenPort: UInt16 = 9000
+    fileprivate var listenPort: UInt16 = 9000
     {
         didSet
         {
-            // Restart listening if port changes while listening
-            if isListening
-            {
-                stopListening()
-                startListening()
-            }
+            updateServer()
+            performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
         }
     }
 
-    @ObservationIgnored fileprivate var addressBindings: [OSCAddressBinding] = []
+    fileprivate var addressBindings: [OSCAddressBinding] = []
     {
         didSet
         {
             self.rebuildPorts()
+            performOnMainAsync { [weak self] in self?._settingsModelStorage?.refreshFromNode() }
         }
     }
 
-    @ObservationIgnored private var oscServer: OSCServer?
-    @ObservationIgnored fileprivate var isListening: Bool = false
+    private var oscServer: OSCServer?
+    /// Whether the node is started. It listens only while started.
+    private var isRunning = false
 
-    // Store latest values for each address
-    @ObservationIgnored private var latestValues: [String: Any] = [:]
+    /// Set while the node is started but its server is not running. Worded
+    /// once, in updateServer(): the glyph, the settings view and the log say
+    /// the same thing.
+    fileprivate var serverStatus: NodeStatus?
+    {
+        didSet
+        {
+            guard serverStatus != oldValue else { return }
+            performOnMainSync { _settingsModelStorage?.serverStatus = serverStatus }
+            self.subtitleSubject.send()
+        }
+    }
+
+    override public func deriveStatuses() -> [NodeStatus] { serverStatus.map { [$0] } ?? [] }
+
+    // Latest value for each address: written on the main queue, read by execute on the render thread.
+    private let latestValues = Mutex<[String: Any]>([:])
 
     // MARK: - Settings View
 
-    override public func providesSettingsView() -> Bool
-    {
-        true
-    }
+    override public func providesSettingsView() -> Bool { true }
 
     override public func settingsView() -> AnyView
     {
-        AnyView(OSCReceiveNodeView(node: self))
+        performOnMainSync
+        {
+            if _settingsModelStorage == nil { _settingsModelStorage = SettingsModel(node: self) }
+            return AnyView(OSCReceiveNodeView(model: _settingsModelStorage!))
+        }
     }
-    
-    override public var settingsSize:SettingsViewSize { .Medium  }
+
+    override public var settingsSize: SettingsViewSize { .Medium }
+
+    // MARK: - Settings Model
+
+    @MainActor
+    @Observable final class SettingsModel
+    {
+        var listenPort: UInt16
+        {
+            didSet
+            {
+                guard let node, listenPort != node.listenPort else { return }
+                node.setSettings(OSCReceiveSettings(listenPort: listenPort, addressBindings: node.addressBindings))
+            }
+        }
+        var addressBindings: [OSCAddressBinding]
+        {
+            didSet
+            {
+                guard let node, addressBindings != node.addressBindings else { return }
+                node.setSettings(OSCReceiveSettings(listenPort: node.listenPort, addressBindings: addressBindings))
+            }
+        }
+        /// Why the server is not running although the node is started, or nil.
+        var serverStatus: NodeStatus?
+        private weak var node: OSCReceiveNode?
+
+        init(node: OSCReceiveNode)
+        {
+            self.node = node
+            self.listenPort = node.listenPort
+            self.addressBindings = node.addressBindings
+            self.serverStatus = node.serverStatus
+        }
+
+        func refreshFromNode()
+        {
+            guard let node else { return }
+            if listenPort != node.listenPort { listenPort = node.listenPort }
+            if addressBindings != node.addressBindings { addressBindings = node.addressBindings }
+        }
+
+        func retryServer() { node?.updateServer() }
+        func addAddressBinding() { node?.addAddressBinding() }
+        func removeAddressBinding(id: UUID) { node?.removeAddressBinding(id: id) }
+    }
+
+    private var _settingsModelStorage: SettingsModel? = nil
 
     // MARK: - Lifecycle
 
-    public override func enableExecution(context: GraphExecutionContext)
+    // The node listens while started. The server is main-thread state, as the
+    // settings view changes the port, so lifecycle calls, which can run on the
+    // render thread, hand over to main with performOnMainAsync, which keeps
+    // them in order.
+    public override func startExecution(renderer: GraphRenderer)
+    throws
     {
-        startListening()
+        performOnMainAsync {
+            self.isRunning = true
+            self.updateServer()
+        }
+        try super.startExecution(renderer: renderer)
     }
 
-    public override func disableExecution(context: GraphExecutionContext)
+    public override func stopExecution(renderer: GraphRenderer)
+    throws
     {
-        stopListening()
+        // The closure holds the node: a deleted node's server must still stop.
+        performOnMainAsync {
+            self.isRunning = false
+            self.updateServer()
+        }
+        try super.stopExecution(renderer: renderer)
     }
 
     // MARK: - Execution
 
-    public override func execute(context: GraphExecutionContext,
-                                  renderPassDescriptor: MTLRenderPassDescriptor,
-                                  commandBuffer: MTLCommandBuffer)
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
+        let currentValues = latestValues.withLock { $0 }
+
         // Send latest values to ports
         for binding in addressBindings
         {
             let portName = portNameForAddress(binding.address)
-            guard let value = latestValues[binding.address] else { continue }
+            guard let value = currentValues[binding.address] else { continue }
 
             switch binding.dataType
             {
@@ -329,32 +450,37 @@ struct OSCReceiveNodeView: View
 
     // MARK: - OSC Server Management
 
-    fileprivate func startListening()
-    {
-        guard !isListening else { return }
-
-        do
-        {
-            oscServer = OSCServer(port: listenPort) { [weak self] message, _ in
-                self?.handleOSCMessage(message)
-            }
-            try oscServer?.start()
-            isListening = true
-            print("OSC Server started on port \(listenPort)")
-        }
-        catch
-        {
-            print("Failed to start OSC server: \(error)")
-            isListening = false
-        }
-    }
-
-    fileprivate func stopListening()
+    /// Replaces any server with one on the current port, if the node is started.
+    /// A server that cannot start, as when its port is taken, is reported in the
+    /// node's status rather than thrown: a throw from start fails the renderer's
+    /// whole start. Changing the port, or Retry in settings, tries again.
+    fileprivate func updateServer()
     {
         oscServer?.stop()
         oscServer = nil
-        isListening = false
-        print("OSC Server stopped")
+
+        guard isRunning else
+        {
+            serverStatus = nil
+            return
+        }
+
+        // Handling reads the address bindings the settings view owns.
+        let server = OSCServer(port: listenPort, queue: .main) { [weak self] message, _, _, _ in
+            self?.handleOSCMessage(message)
+        }
+        do
+        {
+            try server.start()
+            oscServer = server
+            serverStatus = nil
+        }
+        catch
+        {
+            let status = NodeStatus.error("Cannot listen on port \(listenPort): \(error.localizedDescription)")
+            Self.log.error("\(status.message, privacy: .public)")
+            serverStatus = status
+        }
     }
 
     private func handleOSCMessage(_ message: OSCMessage)
@@ -372,37 +498,37 @@ struct OSCReceiveNodeView: View
         case .float:
             if let value = firstArg as? Float
             {
-                latestValues[address] = value
+                latestValues.withLock { $0[address] = value }
             }
             else if let value = firstArg as? Double
             {
-                latestValues[address] = Float(value)
+                latestValues.withLock { $0[address] = Float(value) }
             }
 
         case .int:
             if let value = firstArg as? Int32
             {
-                latestValues[address] = Int(value)
+                latestValues.withLock { $0[address] = Int(value) }
             }
             else if let value = firstArg as? Int
             {
-                latestValues[address] = value
+                latestValues.withLock { $0[address] = value }
             }
 
         case .string:
             if let value = firstArg as? String
             {
-                latestValues[address] = value
+                latestValues.withLock { $0[address] = value }
             }
 
         case .bool:
             if let value = firstArg as? Bool
             {
-                latestValues[address] = value
+                latestValues.withLock { $0[address] = value }
             }
             else if let value = firstArg as? Int32
             {
-                latestValues[address] = value != 0
+                latestValues.withLock { $0[address] = value != 0 }
             }
         }
 
@@ -414,12 +540,12 @@ struct OSCReceiveNodeView: View
     fileprivate func addAddressBinding()
     {
         let newBinding = OSCAddressBinding(address: "/osc/\(addressBindings.count + 1)", dataType: .float)
-        addressBindings.append(newBinding)
+        setSettings(OSCReceiveSettings(listenPort: listenPort, addressBindings: addressBindings + [newBinding]))
     }
 
     fileprivate func removeAddressBinding(id: UUID)
     {
-        addressBindings.removeAll(where: { $0.id == id })
+        setSettings(OSCReceiveSettings(listenPort: listenPort, addressBindings: addressBindings.filter { $0.id != id }))
     }
 
     // MARK: - Port Management

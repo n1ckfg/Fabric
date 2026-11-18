@@ -2,8 +2,15 @@
 	path = Satin
 	url = https://github.com/Fabric-Project/Satin
 [submodule "Lygia"]
-	path = Lygia
+	path = Fabric/lygia
 	url = https://github.com/vade/lygia/
 [submodule "Syphon"]
 	path = Syphon
 	url = https://github.com/Syphon/Syphon-Framework.git
+[submodule "HapInAVFoundation"]
+	path = HapInAVFoundation
+	url = https://github.com/Vidvox/hap-in-avfoundation
+[submodule "Fabric-Samples"]
+	path = Fabric-Samples
+	url = https://github.com/Fabric-Project/Fabric-Samples
+	update = none

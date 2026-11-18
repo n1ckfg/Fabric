@@ -18,36 +18,37 @@ public class NumberEaseNode : Node
     override public class var nodeExecutionMode: Node.ExecutionMode { .Processor }
     override public class var nodeTimeMode: Node.TimeMode { .None } // TODO: Should this change?
     override public class var nodeDescription: String { "Run an easing on an input Number between 0 and 1 and return the resulting Eased Number"}
-    
+
     // Ports
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
-        
+
         return ports +
         [
             ("inputNumber", ParameterPort(parameter: FloatParameter("Number", 0.0, .inputfield, "Normalized input value (0-1) to apply easing to"))),
-            ("inputParam", ParameterPort(parameter: StringParameter("Easing", "Linear", Easing.allCases.map( {$0.title()} ), .dropdown, "Easing function to apply to the input")) ),
-            ("outputNumber", NodePort<Float>(name: NumberNode.name , kind: .Outlet, description: "The eased output value")),
+            ("inputParam", ParameterPort(parameter: StringParameter("Easing", "Linear", TweenEasing.titles, .dropdown, "Easing function to apply to the input")) ),
+            ("outputNumber", NodePort<Float>(name: "Number" , kind: .Outlet, description: "The eased output value")),
         ]
     }
-    
+
     // Port Proxy
     public var inputNumber:ParameterPort<Float> { port(named: "inputNumber") }
     public var inputParam:ParameterPort<String> { port(named: "inputParam") }
     public var outputNumber:NodePort<Float> { port(named: "outputNumber") }
-    
-    private let easingMap = Dictionary(uniqueKeysWithValues: zip(Easing.allCases.map( {$0.title()}), Easing.allCases)  )
 
-    public override func execute(context:GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputNumber.valueDidChange,
            let param = self.inputParam.value,
-           let easeFunc = easingMap[param],
+           let easeFunc = TweenEasing.map[param],
            let loopedTime = self.inputNumber.value//.truncatingRemainder(dividingBy: duration) // TODO: ?? should we loop by 1.0?
         {
             self.outputNumber.send( Float( easeFunc.function( Double(loopedTime) ) ) )
         }
      }
 }
+

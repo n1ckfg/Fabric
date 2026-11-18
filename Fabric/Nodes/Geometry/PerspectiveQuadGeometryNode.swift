@@ -109,6 +109,7 @@ public class PerspectiveQuadGeometry: SatinGeometry
 public class PerspectiveQuadGeometryNode : BaseGeometryNode
 {
     public override class var name: String { "Perspective Quad Geometry" }
+    public override class var nodeDescription: String { "Generates a quad with perspective-correct corner placement" }
 
     override public class func registerPorts(context: Context) -> [(name: String, port: Port)] {
         let ports = super.registerPorts(context: context)
@@ -118,7 +119,7 @@ public class PerspectiveQuadGeometryNode : BaseGeometryNode
             ("inputTopRight",    ParameterPort(parameter: Float2Parameter("Top Right",    simd_float2( 0.5,  0.5), .inputfield, "Top-right corner position"))),
             ("inputBottomLeft",  ParameterPort(parameter: Float2Parameter("Bottom Left",  simd_float2(-0.5, -0.5), .inputfield, "Bottom-left corner position"))),
             ("inputBottomRight", ParameterPort(parameter: Float2Parameter("Bottom Right", simd_float2( 0.5, -0.5), .inputfield, "Bottom-right corner position"))),
-            ("inputResolution",  ParameterPort(parameter: IntParameter("Resolution", 10, .inputfield, "Number of subdivision segments"))),
+            ("inputResolution",  ParameterPort(parameter: IntParameter("Segments", 10, .inputfield, "Number of subdivision segments"))),
         ] + ports
     }
 
@@ -131,9 +132,9 @@ public class PerspectiveQuadGeometryNode : BaseGeometryNode
 
     public override var geometry: SatinGeometry { _geometry }
 
-    private let _geometry = PerspectiveQuadGeometry()
+    private lazy var _geometry = PerspectiveQuadGeometry(context:self.context)
 
-    override public func evaluate(geometry: SatinGeometry, atTime: TimeInterval) -> Bool
+    override public func evaluate(geometry: Geometry, atTime: TimeInterval) -> Bool
     {
         var shouldOutputGeometry = super.evaluate(geometry: geometry, atTime: atTime)
 

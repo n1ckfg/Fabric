@@ -1,3 +1,14 @@
+// description: Displaces a source image along a signed-RG optical flow / velocity field.
+//
+// Industry-standard flow coordinate system (matches LucasKanadeOpticalFlowNode and
+// Satin's velocity buffer):
+//   tex1.r = X displacement in UV space, positive = rightward
+//   tex1.g = Y displacement in UV space, positive = downward (texture-space convention)
+//
+// This is a FORWARD warp: positive flow moves the sample coordinate in the flow direction,
+// so the image appears to scroll opposite to the flow (i.e. motion along +X shifts pixels left).
+// For motion compensation / inverse warp, negate amt.
+
 #include <metal_stdlib>
 using namespace metal;
 
@@ -5,30 +16,27 @@ using namespace metal;
 #define SAMPLER_TYPE texture2d<half>
 
 #include "../../lygia/sampler.msl"
+#include "../../Shaders/FabricImageTextureTransform.metal"
 
-
-// Uniforms -> Fabric UI
 typedef struct {
-    float amt;   // slider, 0.0, 2.0, 0.0, Amount
+    float amt;   // slider, -2.0, 2.0, 1.0, Amount
 } PostUniforms;
 
 fragment half4 postFragment( VertexData                        in        [[stage_in]],
                              constant PostUniforms            &u         [[buffer( FragmentBufferMaterialUniforms )]],
+                             constant float4x4 *imageTransforms [[buffer(FragmentBufferCustom10)]],
                              texture2d<half, access::sample>   tex0      [[texture( FragmentTextureCustom0 )]],
                              texture2d<half, access::sample>   tex1      [[texture( FragmentTextureCustom1 )]] )
 {
     float2 uv = in.texcoord;
 
-    // Sample lookup / displacement texture
-    half4 look = SAMPLER_FNC(tex1, uv);
+    // Sample the flow / velocity field.
+    // Expects standard signed-RG format: R = dx (rightward +), G = dy (downward +).
+    // Compatible with: LucasKanadeOpticalFlowNode, Satin velocity buffers.
+    half2 flow = SAMPLER_FNC(tex1, fabricTextureCoordinate(imageTransforms[1], uv)).rg;
 
-    // offs = vec2(look.y - look.x, look.w - look.z) * amt;
-    float2 offs = float2(float(look.g - look.r),
-                         float(look.a - look.b)) * u.amt;
+    // Displace the UV coordinate along the flow direction.
+    float2 coord = mix(uv, uv + float2(flow), u.amt);
 
-    // Offset coordinates
-    float2 coord = uv + offs;
-
-    // Sample source texture at displaced coords
-    return SAMPLER_FNC(tex0, coord);
+    return SAMPLER_FNC(tex0, fabricTextureCoordinate(imageTransforms[0], coord));
 }

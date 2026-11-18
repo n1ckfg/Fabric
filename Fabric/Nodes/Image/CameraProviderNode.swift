@@ -10,6 +10,9 @@ import Satin
 import simd
 import Metal
 import AVFoundation
+import SwiftUI
+import os
+import Synchronization
 #if os(macOS)
 import CoreMediaIO
 import VideoToolbox
@@ -30,11 +33,17 @@ private let CameraProviderNodeInitializer: Void = {
     var allow : UInt32 = 1
     let sizeOfAllow = MemoryLayout.size(ofValue: allow)
 
-    var property = CMIOObjectPropertyAddress(mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices), mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal), mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    
+    let screenCaptureProperty = CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices)
+    let wirelessCaptureProperty = CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowWirelessScreenCaptureDevices)
+    let globalScope = CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal)
+    let mainElement = CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+    
+    var property = CMIOObjectPropertyAddress(mSelector: screenCaptureProperty, mScope: globalScope, mElement:mainElement )
 
     CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &property, 0, nil, UInt32(sizeOfAllow), &allow)
 
-    property = CMIOObjectPropertyAddress(mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowWirelessScreenCaptureDevices), mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal), mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    property = CMIOObjectPropertyAddress(mSelector: wirelessCaptureProperty, mScope: globalScope, mElement: mainElement)
 
     CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &property, 0, nil, UInt32(sizeOfAllow), &allow)
     #endif
@@ -42,9 +51,12 @@ private let CameraProviderNodeInitializer: Void = {
 
 public class CameraProviderNode : Node
 {
+    fileprivate static let log = Logger(subsystem: "graphics.fabric", category: "CameraProviderNode")
+
     class CaptureDelegate : NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     {
-        var pixelBuffer:CVPixelBuffer? = nil
+        // Written on the capture queue, taken by execute on the render thread.
+        private let latestPixelBuffer = Mutex<CVPixelBuffer?>(nil)
 
         var captureQueue = DispatchQueue(label: "fabric.CameraTextureNode.capture_queue")
 
@@ -58,12 +70,17 @@ public class CameraProviderNode : Node
                 return
             }
 
-            DispatchQueue.main.async {
-
-                self.pixelBuffer = pixelBuffer
-
-            }
+            self.latestPixelBuffer.withLock { $0 = pixelBuffer }
        }
+
+        /// The newest frame since the last call, or nil when none has arrived.
+        func takeLatestPixelBuffer() -> CVPixelBuffer?
+        {
+            self.latestPixelBuffer.withLock { latest in
+                defer { latest = nil }
+                return latest
+            }
+        }
     }
     
     
@@ -87,17 +104,30 @@ public class CameraProviderNode : Node
     public var inputCamera:ParameterPort<String>  { port(named: "inputCamera") }
     public var outputTexturePort:NodePort<FabricImage> { port(named: "outputTexturePort") }
     
-    @ObservationIgnored private let discoverySession = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .continuityCamera, .external,], mediaType: nil, position:.unspecified)
-    @ObservationIgnored private var device: AVCaptureDevice? = nil
-    @ObservationIgnored private var captureSession: AVCaptureSession
-    @ObservationIgnored private let captureDelegate = CaptureDelegate()
+    /// Made at the first enable, not at init: discovering cameras is a call into
+    /// CoreMediaIO that can block for a second, and a node is made far more
+    /// often than it runs (the node browser, opening a document, every-node
+    /// sweeps). Written before the device observers exist, so they only read it.
+    private var discoverySession: AVCaptureDevice.DiscoverySession? = nil
+    private var device: AVCaptureDevice? = nil
+    private var captureSession: AVCaptureSession
+    private let captureDelegate = CaptureDelegate()
 
-    @ObservationIgnored private var observer: Any? = nil
+    private var observer: Any? = nil
     
-    @ObservationIgnored private var devices = [AVCaptureDevice]()
+    // Written on the main queue and at enable, read by execute on the render thread.
+    private let devices = Mutex<[AVCaptureDevice]>([])
+    /// The camera the session captures from, read by the disconnect observer.
+    private let capturingDeviceID = Mutex<String?>(nil)
 
-    @ObservationIgnored private var wasConnectedObserver:Any? = nil
-    @ObservationIgnored private var wasDisconnectedObserver:Any? = nil
+    // Asks execute to build the session: after enable, since disable releases
+    // it, and once camera access or a device arrives. Set from the permission
+    // callback too; a set that lands after a stop does nothing, as only started
+    // nodes execute.
+    private let captureSessionNeedsSetup = Atomic<Bool>(false)
+
+    private var wasConnectedObserver:Any? = nil
+    private var wasDisconnectedObserver:Any? = nil
 
     required public init(context:Context)
     {
@@ -107,8 +137,6 @@ public class CameraProviderNode : Node
         self.captureSession = AVCaptureSession()
 
         super.init(context: context)
-        
-        self.commonPostSetup()
     }
     
     
@@ -117,67 +145,237 @@ public class CameraProviderNode : Node
         // Forces the initialization when the class is accessed
         _ = CameraProviderNodeInitializer
         
-        guard let decodeContext = decoder.context else
-        {
-            fatalError("Required Decode Context Not set")
-        }
-        
         self.captureSession = AVCaptureSession()
                 
         try super.init(from:decoder)
-        
-        self.commonPostSetup()
     }
-    
-    func commonPostSetup()
+
+    override public func enableExecution(renderer:GraphRenderer) throws
     {
-        self.wasConnectedObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: .main)
-        { [weak self] notification in
-            
-            guard let self = self,
-                  let inputCameraParam = self.inputCamera.parameter as? StringParameter
-            else { return }
-            
-            self.devices = self.discoverySession.devices
-            inputCameraParam.options = self.devices.compactMap( { $0.localizedName } )
-        }
-        
-        self.wasDisconnectedObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: .main)
-        { [weak self] notification in
-            
-            guard let self = self,
-                  let inputCameraParam = self.inputCamera.parameter as? StringParameter
-            else { return }
-            
-            self.devices = self.discoverySession.devices
-            inputCameraParam.options = self.devices.compactMap( { $0.localizedName } )
-        }
-        
-        self.devices = self.discoverySession.devices
-        if let inputCameraParam = self.inputCamera.parameter as? StringParameter
+        if self.discoverySession == nil
         {
-            inputCameraParam.options = self.devices.compactMap( { $0.localizedName } )
+            self.discoverySession = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .continuityCamera, .external,], mediaType: nil, position:.unspecified)
         }
 
+        self.wasConnectedObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: .main)
+        { [weak self] _ in
+            guard let self else { return }
+            self.refreshDevices()
+
+            // A device arriving may be what a failed capture was waiting for.
+            if self.captureStatus != nil
+            {
+                self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            }
+        }
+
+        self.wasDisconnectedObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: .main)
+        { [weak self] notification in
+            guard let self else { return }
+            self.refreshDevices()
+
+            // The camera capturing has gone: rebuild, which reports it missing
+            // until it returns. Only started nodes execute the rebuild.
+            if let device = notification.object as? AVCaptureDevice,
+               device.uniqueID == self.capturingDeviceID.withLock({ $0 })
+            {
+                self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            }
+        }
+
+        self.refreshDevices()
+        self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+        try super.enableExecution(renderer: renderer)
+    }
+
+    override public func disableExecution(renderer:GraphRenderer) throws
+    {
+        if let observer = self.wasConnectedObserver    { NotificationCenter.default.removeObserver(observer) }
+        if let observer = self.wasDisconnectedObserver { NotificationCenter.default.removeObserver(observer) }
+        self.wasConnectedObserver = nil
+        self.wasDisconnectedObserver = nil
+
+        // Stop has already stopped it; this lets its device input and output go.
+        self.captureSession = AVCaptureSession()
+        try super.disableExecution(renderer: renderer)
+    }
+
+    private func refreshDevices()
+    {
+        let fresh = self.discoverySession?.devices ?? []
+        self.devices.withLock { $0 = fresh }
+
+        // Enable can run on the render thread; parameter options are observable, main-thread state.
+        let names = fresh.map(\.localizedName)
+        performOnMainAsync {
+            (self.inputCamera.parameter as? StringParameter)?.options = names
+        }
     }
     
+    // Without camera access the node still starts, and outputs nothing.
+    override public func startExecution(renderer:GraphRenderer) throws
+    {
+        performOnMainAsync { self.isRunning = true }
+        self.requestCapture()
+        // Start and stop run and pause a built session, so a stopped node delivers
+        // no frames. One not built, after enable or a failed build, is built by
+        // execute, which reports again what stop cleared. Execute builds only with access.
+        if self.captureSession.inputs.isEmpty || self.captureSession.outputs.isEmpty
+        {
+            self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+        }
+        else if self.captureSession.isRunning == false
+        {
+            self.captureSession.startRunning()
+        }
+        try super.startExecution(renderer: renderer)
+    }
+
+    /// Asks for camera access if it has not been decided, and reports it if refused.
+    private func requestCapture()
+    {
+        switch AVCaptureDevice.authorizationStatus(for: .video)
+        {
+        case .authorized:
+            break
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                guard granted else
+                {
+                    self?.reportCaptureStatus(Self.cameraAccessStatus)
+                    return
+                }
+                self?.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+            }
+        default:
+            self.reportCaptureStatus(Self.cameraAccessStatus)
+        }
+    }
+
+    private static let cameraAccessStatus = NodeStatus.error("Camera access is not allowed. Allow it in System Settings › Privacy & Security › Camera, then Retry.")
+
+    fileprivate func retryCapture()
+    {
+        self.requestCapture()
+        self.captureSessionNeedsSetup.store(true, ordering: .relaxed)
+    }
+
+    // MARK: - Capture Status
+
+    // The status is main-thread state, read by the title and settings views.
+    // Start, stop and execute can run on the render thread, and the permission
+    // callback on any thread, so each hands over to main with performOnMainAsync,
+    // which keeps them in order.
+    private var isRunning = false
+
+    /// Main-thread state, set while the node is started but not capturing. Each
+    /// failure is worded once, where it happens, so the glyph, the settings view
+    /// and the log agree.
+    private var captureStatus: NodeStatus?
+    {
+        didSet
+        {
+            guard captureStatus != oldValue else { return }
+            performOnMainSync
+            {
+                _settingsModelStorage?.captureStatus = captureStatus
+                // Retry is for failures; a warning, such as no camera selected, has nothing to retry.
+                _settingsModelStorage?.canRetry = if case .error = captureStatus { true } else { false }
+            }
+            self.subtitleSubject.send()
+        }
+    }
+
+    override public func deriveStatuses() -> [NodeStatus] { captureStatus.map { [$0] } ?? [] }
+
+    private func reportCaptureStatus(_ status: NodeStatus?)
+    {
+        if let status
+        {
+            Self.log.error("\(status.message, privacy: .public)")
+        }
+        performOnMainAsync {
+            // A failure reported after a stop is no longer the node's state.
+            guard self.isRunning else { return }
+            self.captureStatus = status
+        }
+    }
+
+    // MARK: - Settings View
+
+    override public func providesSettingsView() -> Bool { true }
+
+    @MainActor
+    @Observable final class SettingsModel
+    {
+        /// Why the node is not capturing although it is started, or nil.
+        var captureStatus: NodeStatus?
+        var canRetry = false
+        @ObservationIgnored private weak var node: CameraProviderNode?
+
+        init(node: CameraProviderNode)
+        {
+            self.node = node
+            self.captureStatus = node.captureStatus
+            self.canRetry = if case .error = node.captureStatus { true } else { false }
+        }
+
+        func retryCapture() { node?.retryCapture() }
+    }
+
+    private var _settingsModelStorage: SettingsModel? = nil
+
+    override public func settingsView() -> AnyView
+    {
+        performOnMainSync
+        {
+            if _settingsModelStorage == nil { _settingsModelStorage = SettingsModel(node: self) }
+            return AnyView(CameraProviderNodeSettingsView(model: _settingsModelStorage!))
+        }
+    }
+
+    override public var settingsSize: SettingsViewSize { .Small }
+
+    override public func stopExecution(renderer:GraphRenderer) throws
+    {
+        performOnMainAsync {
+            self.isRunning = false
+            self.captureStatus = nil
+        }
+        if self.captureSession.isRunning
+        {
+            self.captureSession.stopRunning()
+        }
+        try super.stopExecution(renderer: renderer)
+    }
   
-    override public func execute(context:GraphExecutionContext,
-                           renderPassDescriptor: MTLRenderPassDescriptor,
-                           commandBuffer: MTLCommandBuffer)
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
         
-        if self.inputCamera.valueDidChange
+        let setupRequested = self.captureSessionNeedsSetup.exchange(false, ordering: .relaxed)
+        if self.inputCamera.valueDidChange || setupRequested,
+           AVCaptureDevice.authorizationStatus(for: .video) == .authorized
         {
-            updateCameraSession()
+            do
+            {
+                try updateCameraSession()
+            }
+            catch
+            {
+                self.reportCaptureStatus(.error(error.localizedDescription))
+                throw error
+            }
         }
         
-       
-        if let pixelBuffer = self.captureDelegate.pixelBuffer,
-           let renderer = context.graphRenderer,
-           let image = renderer.newImage(fromPixelBuffer: pixelBuffer)
+        if let pixelBuffer = self.captureDelegate.takeLatestPixelBuffer()
         {
-            self.outputTexturePort.send( image )                
+            let image = try renderer.newImage(fromPixelBuffer: pixelBuffer)
+
+            self.outputTexturePort.send( image )
         }
         
      }
@@ -215,46 +413,64 @@ public class CameraProviderNode : Node
         ] as [String : Any]
     }
     
-    private func updateCameraSession()
+    private func updateCameraSession() throws
     {
-        if let deviceLocalizedName = self.inputCamera.value
+        guard let deviceLocalizedName = self.inputCamera.value, !deviceLocalizedName.isEmpty else
         {
-            if let uniqueIDForDeviceWithMatchingName = self.devices.first(where: { $0.localizedName == deviceLocalizedName })?.uniqueID,
-               let device = AVCaptureDevice.init(uniqueID: uniqueIDForDeviceWithMatchingName)
-            {
-                self.setupCaptureSession(videoDevice: device)
-            }
-            else
-            {
-                self.outputTexturePort.send( nil )
-                
-                print("wtf")
-            }
+            self.outputTexturePort.send( nil )
+            self.reportCaptureStatus(.warning("No camera is selected."))
+            return
+        }
+
+        let knownDevices = self.devices.withLock { $0 }
+        if let uniqueIDForDeviceWithMatchingName = knownDevices.first(where: { $0.localizedName == deviceLocalizedName })?.uniqueID,
+           let device = AVCaptureDevice.init(uniqueID: uniqueIDForDeviceWithMatchingName)
+        {
+            try self.setupCaptureSession(videoDevice: device)
+        }
+        else
+        {
+            self.outputTexturePort.send( nil )
+            throw FabricError(.execution(.deviceNotFound),
+                              severity: .recoverable,
+                              message: "Camera device not found: \(deviceLocalizedName)")
         }
     }
     
-    private func setupCaptureSession(videoDevice:AVCaptureDevice)
+    private func setupCaptureSession(videoDevice:AVCaptureDevice) throws
     {
         if self.captureSession.isRunning
         {
             self.captureSession.stopRunning()
-            
-            self.captureSession.inputs.forEach { input in
-                self.captureSession.removeInput(input)
-            }
-            
-            self.captureSession.outputs.forEach { output in
-                self.captureSession.removeOutput(output)
-            }
         }
 
-        guard
-            let videoDeviceInput = try? AVCaptureDeviceInput(device: videoDevice),
-            self.captureSession.canAddInput(videoDeviceInput)
-        else
+        // A stopped session keeps its input and output; a stop then start rebuilds here.
+        self.captureSession.inputs.forEach { input in
+            self.captureSession.removeInput(input)
+        }
+
+        self.captureSession.outputs.forEach { output in
+            self.captureSession.removeOutput(output)
+        }
+
+        let videoDeviceInput: AVCaptureDeviceInput
+        do
         {
-            print("Error: Could not create video device input.")
-            return
+            videoDeviceInput = try AVCaptureDeviceInput(device: videoDevice)
+        }
+        catch
+        {
+            throw FabricError(.execution(.deviceNotFound),
+                              severity: .recoverable,
+                              message: "Could not create camera input for \(videoDevice.localizedName)",
+                              underlyingError: error)
+        }
+
+        guard self.captureSession.canAddInput(videoDeviceInput) else
+        {
+            throw FabricError(.execution(.deviceNotFound),
+                              severity: .recoverable,
+                              message: "Could not add camera input for \(videoDevice.localizedName)")
         }
         
         self.captureSession.beginConfiguration()
@@ -272,16 +488,53 @@ public class CameraProviderNode : Node
             self.captureSession.canAddOutput(videoOutput)
         else
         {
-            print("Error: Could not add video output.")
-            return
+            throw FabricError(.execution(.deviceNotFound),
+                              severity: .recoverable,
+                              message: "Could not add camera output for \(videoDevice.localizedName)")
         }
 
         self.captureSession.addOutput(videoOutput)
         self.captureSession.commitConfiguration()
         
         self.captureSession.startRunning()
-        
+        self.capturingDeviceID.withLock { $0 = videoDevice.uniqueID }
+        self.reportCaptureStatus(nil)
     }
     
    
+}
+
+// MARK: - Settings View
+
+private struct CameraProviderNodeSettingsView: View
+{
+    let model: CameraProviderNode.SettingsModel
+
+    var body: some View
+    {
+        HStack
+        {
+            if let captureStatus = model.captureStatus
+            {
+                NodeStatusMessageView(status: captureStatus)
+            }
+            else
+            {
+                Text("Nothing to report.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if model.canRetry
+            {
+                Button("Retry")
+                {
+                    model.retryCapture()
+                }
+                .controlSize(.small)
+            }
+        }
+    }
 }

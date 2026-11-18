@@ -10,9 +10,15 @@ import Satin
 import simd
 import Metal
 import MetalKit
+import UniformTypeIdentifiers
 
-public class TextFileLoaderNode : Node
+public final class TextFileLoaderNode : Node, NodeFileLoadingProtocol
 {
+    public static var supportedContentTypes: [UTType]
+    {
+        [.plainText, .json, .xml, .yaml, .sourceCode]
+    }
+    
     override public static var name:String { "Text File Loader" }
     override public static var nodeType:Node.NodeType { .Parameter(parameterType: .String) }
     override public class var nodeExecutionMode: Node.ExecutionMode { .Provider }
@@ -26,7 +32,7 @@ public class TextFileLoaderNode : Node
         return ports +
         [
             ("inputFilePathParam", ParameterPort(parameter: StringParameter("Text File", "", .filepicker, "Path to the text file to load"))),
-            ("outputPort", NodePort<String>(name: "Text", kind: .Outlet, description: "Contents of the loaded text file")),
+            ("outputPort", NodePort<String>(name: "String", kind: .Outlet, description: "Contents of the loaded text file")),
         ]
     }
     
@@ -36,16 +42,28 @@ public class TextFileLoaderNode : Node
 
     private var url:URL? = nil
     private var string: String? = nil
+
+    public convenience init(context: Satin.Context, fileURL: URL) throws
+    {
+        self.init(context: context)
+        
+        self.setFileURL(fileURL)
+    }
     
-    
-    override public func execute(context:GraphExecutionContext,
-                           renderPassDescriptor: MTLRenderPassDescriptor,
-                           commandBuffer: MTLCommandBuffer)
-   
+    public func setFileURL(_ url: URL) {
+        self.inputFilePathParam.value = url.fileReference(relativeTo: self.graph?.fileReferenceBaseURL)
+    }
+
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
+                                 renderPassDescriptor: MTLRenderPassDescriptor,
+                                 commandBuffer: MTLCommandBuffer)
+    throws
     {
         if self.inputFilePathParam.valueDidChange
         {
-            self.loadStringFromURL()
+            self.normalizeFileReference(self.inputFilePathParam)
+            try self.loadStringFromURL()
             
             if let string = self.string
             {
@@ -59,18 +77,42 @@ public class TextFileLoaderNode : Node
         }
     }
     
-    private func loadStringFromURL()
+    private func loadStringFromURL() throws
     {
         if let path = self.inputFilePathParam.value,
-           path.isEmpty == false && self.url != URL(string: path)
+           path.isEmpty == false
         {
-            self.url = URL(string: path)
-            
-            if FileManager.default.fileExists(atPath: self.url!.standardizedFileURL.path(percentEncoded: false) )
+            guard let url = URL(fileReference: path, relativeTo: self.graph?.fileReferenceBaseURL) else
             {
-                self.string = try? String(contentsOfFile: self.url!.path, encoding: .utf8)
+                throw FabricError(.execution(.fileNotFound),
+                                  severity: .recoverable,
+                                  message: "Text file path is invalid: \(path)")
+            }
+
+            guard self.url != url else { return }
+
+            self.url = url
+
+            guard FileManager.default.fileExists(atPath: url.standardizedFileURL.path(percentEncoded: false)) else
+            {
+                self.string = nil
+                throw FabricError(.execution(.fileNotFound),
+                                  severity: .recoverable,
+                                  message: "Text file not found: \(url.path)")
+            }
+
+            do
+            {
+                self.string = try String(contentsOfFile: url.path, encoding: .utf8)
+            }
+            catch
+            {
+                self.string = nil
+                throw FabricError(.execution(.failed),
+                                  severity: .recoverable,
+                                  message: "Could not load text file: \(url.path)",
+                                  underlyingError: error)
             }
         }
-        
     }
 }

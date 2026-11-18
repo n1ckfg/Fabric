@@ -12,69 +12,143 @@ import Metal
 import Fabric
 import Satin
 
+@MainActor
+final class ActiveFabricDocumentStore
+{
+    static let shared = ActiveFabricDocumentStore()
+
+    weak var activeDocument: FabricDocument?
+
+    private init() {}
+}
+
 extension UTType {
     static var fabricDocument: UTType {
-        UTType(importedAs: "info.HiRez.fabric")
+        UTType(importedAs: "graphics.fabric.document")
     }
 }
 
 class FabricDocument: FileDocument
 {
     static var readableContentTypes: [UTType] { [.fabricDocument] }
+    static var writableContentTypes: [UTType] { [.fabricDocument] }
 
     @ObservationIgnored let context = Context(device: MTLCreateSystemDefaultDevice()!,
-                           sampleCount: 1,
-                           colorPixelFormat: .rgba16Float,
-                           depthPixelFormat: .depth32Float,
-                           stencilPixelFormat: .stencil8)
-    let graph:Graph
+                                              sampleCount: 1,
+                                              colorPixelFormat: .rgba16Float,
+                                              depthPixelFormat: .depth32Float,
+                                              stencilPixelFormat: .stencil8,
+                                              alphaOitEnabled: true)
+
+    // FileDocument's write configuration has no destination URL. Keep the
+    // exact snapshot until the scene reports the completed save's location.
+    private var lastWrittenGraph: (data: Data, baseURL: URL?)?
+
+    //    let graph:Graph
     var graphName:String = "Untitled"
-    
-    @ObservationIgnored var outputWindowManager:DocumentOutputWindowManager? = nil
+    let renderer:GraphRenderer
+    let editingContext: GraphCanvasContext
+
+    @ObservationIgnored var outputPresenter: OutputPresenter? = nil
+    private var outputPresentationHostCount = 0
+    @MainActor lazy var movieExportCoordinator = MovieExportCoordinator()
     
     init()
     {
-        self.graph = Graph(context: self.context)
-        
+        let graph = Graph(context: self.context)
+        self.editingContext = GraphCanvasContext(rootGraph: graph)
+        self.renderer = GraphRenderer(context: self.context, graph: graph)
     }
     
     init(withTemplate: Bool)
     {
         print("Basic Document Init")
-        self.graph = Graph(context: self.context)
+        let graph = Graph(context: self.context)
 
+        self.editingContext = GraphCanvasContext(rootGraph: graph)
+        self.renderer = GraphRenderer(context: self.context, graph: graph)
+
+        // Spin toggle, published as 'Spin?'
+        let spinNode = PassThroughNode<Bool>(context: self.context)
+        spinNode.input.published = true
+        spinNode.input.publishedName = "Spin?"
+        spinNode.input.value = true
+
+        // Math expression: Amount * Speed, with 'Speed' published
+        let mathNode = MathExpressionNode(context: self.context, expression: "Amount * Speed")
+
+        let speedPort = mathNode.findPort(named: "Speed", as: ParameterPort<Float>.self)!
+        speedPort.published = true
+        speedPort.value = 10
+
+        // Smooth the stepped speed into a ramp (springy, slightly bouncy)
+        let smoothNode = NumberSmoothNode(context: self.context, strategy: SmoothFilterMode.spring)
+        smoothNode.findPort(named: "inputDamping", as: ParameterPort<Float>.self)!.value = 0.2
+
+        // Rotation driver: integrates its input every frame
+        let integralNode = NumberIntegralNode(context: self.context)
+
+
+        // Euler orientation (drives mesh rotation on X and Y). Defaults to
+        // the "Euler" strategy, whose inputX/inputY/inputZ/outputOrientation
+        // ports are dynamic (added by StrategyNode), hence findPort below
+        // instead of typed accessor properties.
+        let eulerNode = ComposeOrientationNode(context: self.context)
+
+        // Geometry, material, mesh
         let boxNode = BoxGeometryNode(context: self.context)
-        boxNode.offset = CGSize(width: -400, height:0)
 
         let materialNode = StandardMaterialNode(context: self.context)
-        materialNode.offset = CGSize(width: -400, height: 200)
 
         let meshNode = MeshNode(context: self.context)
-        meshNode.offset = CGSize(width: -200, height: 100)
 
-        let cameraNode = PerspectiveCameraNode(context: self.context)
-        cameraNode.offset = CGSize(width: 200 , height: 50)
-        cameraNode.inputPosition.value = simd_float3(0, 0, 3)
-        
+        // Light. No camera: a graph renders through the camera node's own
+        // defaults until one is added, so a camera here would only be the
+        // camera any added one has to displace.
         let directionalLightNode = DirectionalLightNode(context: self.context)
         directionalLightNode.inputPosition.value = SIMD3<Float>(1, 2, 5)
-        directionalLightNode.offset = CGSize(width: 0, height: -200)
 
-        boxNode.outputGeometry.connect(to: meshNode.inputGeometry)
-        materialNode.outputMaterial.connect(to: meshNode.inputMaterial)
+        // Ports can only register connections after their nodes belong to the graph.
+        self.editingContext.currentGraph.addNode(spinNode)
+        self.editingContext.currentGraph.addNode(mathNode)
+        self.editingContext.currentGraph.addNode(smoothNode)
+        self.editingContext.currentGraph.addNode(integralNode)
+        self.editingContext.currentGraph.addNode(eulerNode)
+        self.editingContext.currentGraph.addNode(boxNode)
+        self.editingContext.currentGraph.addNode(materialNode)
+        self.editingContext.currentGraph.addNode(meshNode)
+        self.editingContext.currentGraph.addNode(directionalLightNode)
 
-        self.graph.addNode(boxNode)
-        self.graph.addNode(materialNode)
-        self.graph.addNode(meshNode)
-        self.graph.addNode(directionalLightNode)
-        self.graph.addNode(cameraNode)
+        // Connections — animation chain
+        self.editingContext.currentGraph.connect(spinNode.output, to: mathNode.findPort(named: "Amount", as: ParameterPort<Float>.self)!)
+        self.editingContext.currentGraph.connect(mathNode.findPort(named: "result", as: NodePort<Float>.self)!, to: smoothNode.findPort(named: "inputNumber", as: ParameterPort<Float>.self)!)
+        self.editingContext.currentGraph.connect(smoothNode.findPort(named: "outputNumber", as: NodePort<Float>.self)!, to: integralNode.inputNumber)
+        self.editingContext.currentGraph.connect(integralNode.outputNumber, to: eulerNode.findPort(named: "inputX", as: ParameterPort<Float>.self)!)
+        self.editingContext.currentGraph.connect(integralNode.outputNumber, to: eulerNode.findPort(named: "inputY", as: ParameterPort<Float>.self)!)
+        self.editingContext.currentGraph.connect(eulerNode.findPort(named: "outputOrientation", as: NodePort<simd_float4>.self)!, to: meshNode.inputOrientation)
+
+        // Connections — geometry
+        self.editingContext.currentGraph.connect(boxNode.outputGeometry, to: meshNode.inputGeometry)
+        self.editingContext.currentGraph.connect(materialNode.outputMaterial, to: meshNode.inputMaterial)
+
+        // Auto-layout the graph
+        self.editingContext.currentGraph.autoLayout()
+        
+        Task
+        {
+            await MainActor.run {
+                ActiveFabricDocumentStore.shared.activeDocument = self
+            }
+        }
     }
-    
+
     required init(configuration: ReadConfiguration) throws
     {
         print("Read Configuration Document Init")
 
-        guard let data = configuration.file.regularFileContents,
+        let data = configuration.file.regularFileContents
+
+        guard let data,
               let name = configuration.file.filename
         else
         {
@@ -86,35 +160,331 @@ class FabricDocument: FileDocument
         let decodeContext = DecoderContext(documentContext: self.context)
         decoder.context = decodeContext
         
-        self.graph = try decoder.decode(Graph.self, from: data)
+        let graph = try decoder.decode(Graph.self, from: data)
+
+        self.editingContext = GraphCanvasContext(rootGraph: graph)
+        self.renderer = GraphRenderer(context: self.context, graph: graph)
+
         self.graphName = name
+
+        Task
+        {
+            await MainActor.run {
+                ActiveFabricDocumentStore.shared.activeDocument = self
+                self.presentLoadDiagnosticsAlertIfNeeded(for: graph)
+            }
+        }
     }
 
     deinit
     {
-        print("Deinit Closing window for graph: \(self.graph.id)")
+        print("Deinit Closing window for graph: \(self.editingContext.rootGraph.id)")
       
     }
 
-    func setupOutputWindow()
+    @MainActor
+    func setupOutputPresentation()
     {
-        self.outputWindowManager = DocumentOutputWindowManager()
-        self.outputWindowManager?.setGraph(graph: self.graph)
-        self.outputWindowManager?.setWindowName(self.graphName)
+        self.outputPresentationHostCount += 1
+        guard self.outputPresenter == nil else { return }
+
+        self.outputPresenter = OutputPresenter(ownerDocument: self, renderer: self.renderer)
+        self.outputPresenter?.setWindowTitle(self.graphName)
+        ActiveFabricDocumentStore.shared.activeDocument = self
     }
-    
-    func closeOutputWindow()
+
+    /// SwiftUI supplies the destination through the scene after serialization.
+    /// Rebase the saved snapshot as well as the live graph on first save / Save As.
+    @MainActor
+    func updateDocumentURL(_ documentURL: URL?)
     {
-        self.outputWindowManager?.closeOutputWindow()
+        guard let documentURL else { return }
+        let directoryURL = documentURL.deletingLastPathComponent().standardizedFileURL
+        let graph = self.editingContext.rootGraph
+
+        if let writtenGraph = self.lastWrittenGraph,
+           writtenGraph.baseURL != directoryURL
+        {
+            do
+            {
+                let decoder = JSONDecoder()
+                decoder.context = DecoderContext(documentContext: self.context,
+                                                 fileReferenceBaseURL: writtenGraph.baseURL)
+                let savedGraph = try decoder.decode(Graph.self, from: writtenGraph.data)
+                savedGraph.rewriteFileReferences(relativeTo: directoryURL)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted]
+                let rebasedData = try encoder.encode(savedGraph)
+
+                // Coordinate the follow-up write and never overwrite contents
+                // that have changed since the snapshot SwiftUI just saved.
+                var coordinationError: NSError?
+                var writeError: Error?
+                NSFileCoordinator().coordinate(writingItemAt: documentURL,
+                                                options: .forReplacing,
+                                                error: &coordinationError) { coordinatedURL in
+                    do
+                    {
+                        guard try Data(contentsOf: coordinatedURL) == writtenGraph.data else
+                        {
+                            throw CocoaError(.fileWriteFileExists)
+                        }
+                        try rebasedData.write(to: coordinatedURL, options: .atomic)
+                    }
+                    catch { writeError = error }
+                }
+                if let error = coordinationError ?? writeError { throw error }
+            }
+            catch
+            {
+                self.presentAlert(title: "Could Not Update Saved File Paths",
+                                  message: "Save the document again to write its relative paths. \(error.localizedDescription)")
+            }
+
+            graph.rewriteFileReferences(relativeTo: directoryURL)
+        }
+        else
+        {
+            // Opening a graph installs its base without moving its references.
+            graph.updateFileReferenceBaseURL(directoryURL)
+        }
+
+        self.lastWrittenGraph = nil
+        self.graphName = documentURL.lastPathComponent
+    }
+
+    @MainActor
+    func teardownOutputPresentation()
+    {
+        // Editor re-parenting (window tab merge, scene restore) runs the new
+        // host view's onAppear before the old one's onDisappear; only the
+        // last host leaving may tear the shared presenter down.
+        self.outputPresentationHostCount = max(0, self.outputPresentationHostCount - 1)
+        guard self.outputPresentationHostCount == 0 else { return }
+
+        self.outputPresenter?.teardown()
+        self.outputPresenter = nil
+        if ActiveFabricDocumentStore.shared.activeDocument === self {
+            ActiveFabricDocumentStore.shared.activeDocument = nil
+        }
+    }
+
+    @MainActor
+    func exportSnapshotImage()
+    {
+        let snapshotExportTime = self.renderer.currentExecutionInfo.timing.time
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.png]
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.nameFieldStringValue = self.defaultImageExportFilename()
+
+        guard savePanel.runModal() == .OK, let url = savePanel.url else {
+            return
+        }
+
+        let configuration = GraphImageExportConfiguration(
+            url: url,
+            size: (width: 1920, height:1080),
+            time: snapshotExportTime,
+            format: .png
+        )
+
+        let exporter = GraphImageExporter(
+            graph: self.editingContext.rootGraph,
+            context: self.context,
+            configuration: configuration
+        )
+
+        do {
+            try exporter.export()
+        } catch {
+            self.presentAlert(
+                title: "Image Export Failed",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    @MainActor
+    func exportMovie()
+    {
+        self.movieExportCoordinator.present(initialSettings: MovieExportSettings(
+            startTime: 0,
+            duration: 5
+        ))
+    }
+
+    @MainActor
+    func dismissMovieExportSheet()
+    {
+        self.movieExportCoordinator.dismiss()
+    }
+
+    @MainActor
+    func continueMovieExport(with exportConfiguration: MovieExportConfiguration)
+    {
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [UTType(filenameExtension: "mov") ?? .movie]
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.nameFieldStringValue = self.defaultMovieExportFilename()
+
+        guard savePanel.runModal() == .OK, let url = savePanel.url else {
+            return
+        }
+
+        let configuration = GraphMovieExportConfiguration(
+            url: url,
+            size: exportConfiguration.size,
+            startTime: exportConfiguration.startTime,
+            duration: exportConfiguration.duration,
+            frameRate: exportConfiguration.frameRate,
+            codec: exportConfiguration.codec
+        )
+
+        let exporter = GraphMovieExporter(
+            graph: self.editingContext.rootGraph,
+            context: self.context,
+            configuration: configuration
+        )
+
+        let totalFrames = configuration.expectedFrameCount ?? 0
+        let exportTask = Task {
+            do {
+                try await exporter.export { completedFrames, totalFrames in
+                    self.movieExportCoordinator.updateProgress(
+                        completedFrames: completedFrames,
+                        totalFrames: totalFrames
+                    )
+                }
+
+                await MainActor.run {
+                    self.movieExportCoordinator.completeExport()
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.removeIncompleteMovieExport(at: url)
+                    self.movieExportCoordinator.failExport(message: nil)
+                }
+            } catch {
+                await MainActor.run {
+                    self.removeIncompleteMovieExport(at: url)
+                    self.movieExportCoordinator.failExport(message: error.localizedDescription)
+                }
+            }
+        }
+
+        self.movieExportCoordinator.beginExport(
+            destinationURL: url,
+            totalFrames: totalFrames,
+            task: exportTask
+        )
     }
     
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper
     {
+        let graph = self.editingContext.rootGraph
+        graph.rewriteFileReferences(relativeTo: graph.fileReferenceBaseURL)
+
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
         
-        let data = try encoder.encode(self.graph)
-        
+        let data = try encoder.encode(self.editingContext.rootGraph)
+        self.lastWrittenGraph = (data, self.editingContext.rootGraph.fileReferenceBaseURL)
+
         return .init(regularFileWithContents: data)
+    }
+
+    private func defaultImageExportFilename() -> String
+    {
+        let sanitizedGraphName = self.graphName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if sanitizedGraphName.isEmpty {
+            return "Untitled.png"
+        }
+
+        return "\(sanitizedGraphName).png"
+    }
+
+    private func defaultMovieExportFilename() -> String
+    {
+        let sanitizedGraphName = self.graphName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if sanitizedGraphName.isEmpty {
+            return "Untitled.mov"
+        }
+
+        return "\(sanitizedGraphName).mov"
+    }
+
+    @MainActor
+    private func presentAlert(title: String, message: String)
+    {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    /// A node this document referenced could not be loaded, or a wire/port's
+    /// saved state couldn't be restored (see Graph.MissingNodeDiagnostic /
+    /// DroppedConnectionDiagnostic / DroppedPortStateDiagnostic) — the rest of
+    /// the graph loaded fine, but silently dropping this on the floor would
+    /// hide real data loss from whoever opened the document.
+    ///
+    /// Only checks the root graph: a missing node nested inside a subgraph
+    /// isn't surfaced here today, since subgraphs decode as their own Graph
+    /// instances with their own diagnostics arrays.
+    @MainActor
+    private func presentLoadDiagnosticsAlertIfNeeded(for graph: Graph)
+    {
+        // Several un-renamed instances of the same node type (e.g. two
+        // Erosion nodes both losing the same retired key) produce identical
+        // lines with nothing else to distinguish them for a reader; collapse
+        // those to one line with a count instead of repeating them verbatim.
+        func section(_ title: String, _ lines: [String]) -> String?
+        {
+            guard lines.isEmpty == false else { return nil }
+
+            var countByLine: [String: Int] = [:]
+            var firstSeenOrder: [String] = []
+            for line in lines
+            {
+                if countByLine[line] == nil { firstSeenOrder.append(line) }
+                countByLine[line, default: 0] += 1
+            }
+
+            let deduped = firstSeenOrder.map { line -> String in
+                let count = countByLine[line, default: 1]
+                return count > 1 ? "\(line) (×\(count))" : line
+            }
+
+            return "\(title):\n" + deduped.map { "• \($0)" }.joined(separator: "\n")
+        }
+
+        let sections = [
+            section("Missing nodes", graph.missingNodeDiagnostics.map(\.summary)),
+            section("Dropped connections", graph.droppedConnectionDiagnostics.map(\.summary)),
+            section("Dropped port state", graph.droppedPortStateDiagnostics.map {
+                "'\($0.nodeTitle)' dropped: \($0.droppedRegistryKeys.joined(separator: ", "))"
+            })
+        ].compactMap { $0 }
+
+        guard sections.isEmpty == false else { return }
+
+        self.presentAlert(
+            title: "Document Loaded With Warnings",
+            message: sections.joined(separator: "\n\n")
+        )
+    }
+
+    @MainActor
+    private func removeIncompleteMovieExport(at url: URL)
+    {
+        if FileManager.default.fileExists(atPath: url.path()) {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 }

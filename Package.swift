@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .library(
             name: "Fabric",
+            type: .dynamic,
             targets: ["Fabric"]
         ),
     ],
@@ -16,17 +17,23 @@ let package = Package(
         // Local Satin package
         .package(path: "Satin"),
 
+        // Standalone expression engine (backs the Math Expression node), and its
+        // editor support product (the language the code editor is configured with)
+        .package(url: "https://github.com/Fabric-Project/MathExpressionEngine", from: "1.2.0"),
+
         // External dependencies
         .package(url: "https://github.com/Flight-School/AnyCodable", from: "0.6.7"),
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.29.1"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.29.1"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.3"),
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-async-algorithms.git", from: "1.0.0"),
         .package(url: "https://github.com/tayloraswift/swift-noise", from: "1.0.0"),
         .package(url: "https://github.com/vade/SwiftSimplify", branch: "master"),
-        .package(url: "https://github.com/gonzalezreal/textual", from: "0.1.1"),
-        .package(url: "https://github.com/bradhowes/swift-math-parser", from: "3.5.0"),
+        .package(url: "https://github.com/gonzalezreal/textual", from: "0.5.0"),
         .package(url: "https://github.com/orchetect/OSCKit", from: "2.1.1"),
-        .package(url: "https://github.com/orchetect/MIDIKit", from: "0.10.7"),
+        .package(url: "https://github.com/orchetect/MIDIKit", from: "0.12.0"),
+        .package(url: "https://github.com/mchakravarty/CodeEditorView.git", from: "0.7.0"),
     ],
     targets: [
         // C++ support for SuperShapeGenerator
@@ -65,20 +72,30 @@ let package = Package(
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
                 .product(name: "Noise", package: "swift-noise"),
                 .product(name: "SwiftSimplify", package: "SwiftSimplify"),
                 .product(name: "Textual", package: "textual"),
-                .product(name: "MathParser", package: "swift-math-parser"),
+                .product(name: "MathExpressionEngine", package: "MathExpressionEngine"),
+                .product(name: "MathExpressionEditorSupport", package: "MathExpressionEngine"),
                 .product(name: "OSCKit", package: "OSCKit"),
                 .product(name: "MIDIKit", package: "MIDIKit"),
+                .product(name: "CodeEditorView", package: "CodeEditorView"),
+                .product(name: "LanguageSupport", package: "CodeEditorView"),
                 .target(name: "Syphon", condition: .when(platforms: [.macOS])),
+                .target(name: "HapInAVFoundation", condition: .when(platforms: [.macOS])),
             ],
             path: "Fabric",
             exclude: [
                 "Nodes/Geometry/SuperShape/SuperShapeGenerator.mm",
                 "Nodes/Geometry/SuperShape/SuperShapeGenerator.h",
                 "Nodes/Deprecated",
+                // Read on GitHub, where the JavaScript node's settings link to
+                // it. Named here so it is not taken for an unhandled resource.
+                "Nodes/Utility/JavaScriptNodeGuidance.markdown",
                 "Nodes/Parameters/Number/Deprecated",
                 "module.modulemap",
                 "Fabric.h",
@@ -96,6 +113,7 @@ let package = Package(
             ],
             swiftSettings: [
                 .define("FABRIC_SYPHON_ENABLED", .when(platforms: [.macOS])),
+                .define("FABRIC_HAP_ENABLED", .when(platforms: [.macOS])),
             ]
         ),
 
@@ -103,6 +121,24 @@ let package = Package(
         .binaryTarget(
             name: "Syphon",
             path: "Frameworks/Syphon.xcframework"
+        ),
+
+        // HapInAVFoundation — Hap codec decoder for AVFoundation
+        // (macOS only). Embedded libsquish + libsnappy come along
+        // inside the xcframework.
+        .binaryTarget(
+            name: "HapInAVFoundation",
+            path: "Frameworks/HapInAVFoundation.xcframework"
+        ),
+
+        // Tests
+        .testTarget(
+            name: "FabricTests",
+            dependencies: ["Fabric"],
+            path: "Tests",
+            swiftSettings: [
+                .define("FABRIC_SYPHON_ENABLED", .when(platforms: [.macOS])),
+            ]
         ),
 
     ],

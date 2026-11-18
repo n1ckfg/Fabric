@@ -9,13 +9,13 @@ public final class ZoomBlurNode: BaseMultiPassBlurEffectNode {
     override public class var nodeTimeMode: Node.TimeMode { .None }
     override public class var nodeDescription: String { "Radial blur centered around a controllable origin." }
 
-    override class var sourceShaderName: String { "ZoomBlurShader" }
+    override public class var sourceShaderName: String { "ZoomBlurShader" }
 
     private struct ZoomPassUniforms {
         var amountScale: Float
     }
 
-    @ObservationIgnored private var passUniformsBuffers: [StructBuffer<ZoomPassUniforms>] = []
+    private var passUniformsBuffers: [StructBuffer<ZoomPassUniforms>] = []
 
     required init(context: Context, fileURL: URL) throws {
         try super.init(context: context, fileURL: fileURL)
@@ -39,18 +39,20 @@ public final class ZoomBlurNode: BaseMultiPassBlurEffectNode {
         return self.passUniformsBuffers[index]
     }
 
-    override public func execute(context: GraphExecutionContext,
+    override public func execute(renderer:GraphRenderer,
+                                 executionInfo:GraphExecutionInfo,
                                  renderPassDescriptor: MTLRenderPassDescriptor,
                                  commandBuffer: MTLCommandBuffer)
+    throws
     {
-//        guard self.shouldExecuteThisFrame() else {
-//            return
-//        }
 
-        guard let inputTexture = self.inputTexturePort.value?.texture else {
+        guard let inputImage = self.validatedSingleInputImage() else {
             self.outputTexturePort.send(nil)
             return
         }
+
+        let outputWidth = Int(inputImage.presentationSize.width.rounded())
+        let outputHeight = Int(inputImage.presentationSize.height.rounded())
 
         let amount = self.floatParameterValue(named: "Amount")
 
@@ -92,8 +94,8 @@ public final class ZoomBlurNode: BaseMultiPassBlurEffectNode {
             ]
 
             for stage in stageRatios {
-                let stageSize = self.scaledPassSize(baseWidth: inputTexture.width,
-                                                    baseHeight: inputTexture.height,
+                let stageSize = self.scaledPassSize(baseWidth: outputWidth,
+                                                    baseHeight: outputHeight,
                                                     amount: amount,
                                                     passRatio: stage.ratio)
 
@@ -102,12 +104,13 @@ public final class ZoomBlurNode: BaseMultiPassBlurEffectNode {
                                            amountScale: stage.multiplier))
             }
 
-        steps.append(MultiPassStep(width: inputTexture.width, height: inputTexture.height, amountScale: 1.0))
+        steps.append(MultiPassStep(width: outputWidth, height: outputHeight, amountScale: 1.0))
 //        }
 
-        if let outputImage = self.runPassChain(context: context,
+        if let outputImage = try self.runPassChain(renderer: renderer,
+                                               executionInfo: executionInfo,
                                                commandBuffer: commandBuffer,
-                                               inputTexture: inputTexture,
+                                               inputImage: inputImage,
                                                steps: steps,
                                                prepareStep: { [weak self] stepIndex, step in
             guard let self else { return }

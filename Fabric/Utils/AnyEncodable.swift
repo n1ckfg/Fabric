@@ -18,17 +18,22 @@ public class DecoderContext
     public static let decoderContextKey = CodingUserInfoKey(rawValue: "decoderCntextKey")!
     
     public let documentContext:Context
+
+    /// Directory against which persisted, scheme-less file paths resolve.
+    /// SwiftUI's FileDocument read configuration does not provide the source
+    /// URL, so hosts may set this later when their document scene supplies it.
+    public var fileReferenceBaseURL: URL?
     
     public var currentGraph:Graph?
-    public var currentGraphNodes:[Node]?
     
     public init(documentContext: Context,
                 currentGraph: Graph? = nil,
-                currentGraphNodes: [Node]? = nil)
+                fileReferenceBaseURL: URL? = nil,
+                )
     {
         self.documentContext = documentContext
         self.currentGraph = currentGraph
-        self.currentGraphNodes = currentGraphNodes
+        self.fileReferenceBaseURL = fileReferenceBaseURL
     }
 }
 
@@ -68,7 +73,6 @@ struct AnyCodableMap : Codable
 //        try container.encode(self.item)
 //    }
 //}
-
 
 
 
