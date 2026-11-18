@@ -10,7 +10,12 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 
 cd "$DIR"
 
-xcodebuild -downloadComponent MetalToolchain                                  
+git submodule init
 git submodule update --init --recursive
-bash ./scripts/build-syphon-xcframework.sh
+git submodule sync
 
+xcodebuild -downloadComponent MetalToolchain
+xcodebuild -resolvePackageDependencies -project Fabric                                  
+
+bash ./scripts/build-syphon-xcframework.sh
+bash ./scripts/build-hapinavfoundation-xcframework.sh
